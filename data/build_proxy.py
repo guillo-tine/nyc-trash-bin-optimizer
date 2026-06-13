@@ -1,5 +1,5 @@
 """
-build_proxy.py — builds the "composite" activity data for the Trash Bin Optimizer.
+build_proxy.py - builds the "composite" activity data for the Trash Bin Optimizer.
 ====================================================================================
 
 You run this ONCE, offline:
@@ -25,11 +25,11 @@ WHAT IT DOES (same four-ish steps for every data source)
 
 THE DATA SOURCES
 ----------------
-    1. 311 street complaints  (NYC)   — dense everywhere people live   -> score_311
-    2. Subway ridership       (MTA)   — strong near stations           -> score_mta
-    3. Citibike trips         (S3)    — only inside the bike network    -> score_citibike
-    4. DOT pedestrian counts  (NYC)   — 114 REAL counts, used as a check (not a score)
-    5. LODES population       (Census)— optional, to divide out density (off by default)
+    1. 311 street complaints  (NYC)   - dense everywhere people live   -> score_311
+    2. Subway ridership       (MTA)   - strong near stations           -> score_mta
+    3. Citibike trips         (S3)    - only inside the bike network    -> score_citibike
+    4. DOT pedestrian counts  (NYC)   - 114 REAL counts, used as a check (not a score)
+    5. LODES population       (Census)- optional, to divide out density (off by default)
 
 Every download is cached in  _proxy_cache/  so re-running is fast. If a source can't
 be reached, that layer is simply skipped instead of crashing the whole build.
@@ -56,7 +56,7 @@ OUT_CSV   = DATA_DIR / "activity_grid.csv"      # the file this script produces
 CACHE_DIR = DATA_DIR / "_proxy_cache"           # downloaded data is cached here
 CACHE_DIR.mkdir(exist_ok=True)
 
-GRID_SIZE_M      = 250        # square size in meters — must match app.py
+GRID_SIZE_M      = 250        # square size in meters - must match app.py
 EQUITY_FLOOR_PCT = 0.05       # populated squares never score below the 5th percentile
 
 # How much data to pull / which optional steps to run.
@@ -156,7 +156,7 @@ def aggregate_to_grid(cells_df: pd.DataFrame) -> pd.Series:
 
 
 # ===========================================================================
-# Source 1 — NYC 311 street complaints
+# Source 1 - NYC 311 street complaints
 # ===========================================================================
 # We only keep OUTDOOR complaint types (these track street activity, not indoor issues).
 STREET_311_TYPES = (
@@ -169,7 +169,7 @@ def fetch_311() -> pd.Series:
     """Score per square = number of 311 street complaints in it.
 
     The dataset is huge, so we download it in 50k-row pages and retry a page up to
-    3 times — that way one slow request can't kill the whole download.
+    3 times - that way one slow request can't kill the whole download.
     """
     cache_path = CACHE_DIR / "311_street.parquet"
     try:
@@ -220,7 +220,7 @@ def fetch_311() -> pd.Series:
 
 
 # ===========================================================================
-# Source 2 — MTA subway ridership
+# Source 2 - MTA subway ridership
 # ===========================================================================
 def fetch_mta() -> pd.Series:
     """Score per square = total subway riders at stations in it.
@@ -253,7 +253,7 @@ def fetch_mta() -> pd.Series:
 
 
 # ===========================================================================
-# Source 3 — Citibike trips (most recent month)
+# Source 3 - Citibike trips (most recent month)
 # ===========================================================================
 def fetch_citibike() -> pd.Series:
     """Score per square = number of Citibike trip starts/ends in it.
@@ -293,7 +293,7 @@ def fetch_citibike() -> pd.Series:
             csv_name = next(n for n in zf.namelist() if n.endswith(".csv"))
             raw = pd.read_csv(zf.open(csv_name))
 
-        # Column names have changed over the years — find the start/end lat/lon columns.
+        # Column names have changed over the years - find the start/end lat/lon columns.
         raw.columns = raw.columns.str.lower().str.replace(" ", "_")
         lat_start = next((c for c in raw.columns if "start" in c and "lat" in c), None)
         lon_start = next((c for c in raw.columns if "start" in c and ("lon" in c or "lng" in c)), None)
@@ -324,7 +324,7 @@ def fetch_citibike() -> pd.Series:
 
 
 # ===========================================================================
-# Source 4 — DOT pedestrian counts (a REALITY CHECK, not a score)
+# Source 4 - DOT pedestrian counts (a REALITY CHECK, not a score)
 # ===========================================================================
 def fetch_dot_counts() -> pd.DataFrame:
     """The 114 locations where DOT actually measured pedestrians.
@@ -367,7 +367,7 @@ def fetch_dot_counts() -> pd.DataFrame:
 
 
 # ===========================================================================
-# Source 5 — LODES population (optional density correction, OFF by default)
+# Source 5 - LODES population (optional density correction, OFF by default)
 # ===========================================================================
 # This downloads Census files to estimate how many people live/work in each square,
 # so busy-because-crowded areas don't automatically dominate. It's heavy and flaky,
@@ -469,7 +469,7 @@ def fetch_lodes_denominator() -> pd.Series:
 
 
 # ===========================================================================
-# DOT reality-check column (diagnostic only — not used to place bins)
+# DOT reality-check column (diagnostic only - not used to place bins)
 # ===========================================================================
 def dot_calibration_flag(grid_df: pd.DataFrame, dot_df: pd.DataFrame) -> pd.Series:
     """For each square, the real DOT count of the nearest DOT location within 500m
@@ -584,7 +584,7 @@ def build_grid() -> pd.DataFrame:
     # Attach the DOT reality-check column.
     grid["dot_calibration"] = dot_calibration_flag(grid, dot_df).values
 
-    # The app reads "activity_score" — that's just our composite.
+    # The app reads "activity_score" - that's just our composite.
     grid["activity_score"] = grid["composite"]
 
     log(f"Grid complete: {len(grid):,} cells across NYC")
@@ -596,7 +596,7 @@ def build_grid() -> pd.DataFrame:
 # ===========================================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("NYC Trash Bin Optimizer — Pedestrian Proxy Grid Builder")
+    print("NYC Trash Bin Optimizer - Pedestrian Proxy Grid Builder")
     print("=" * 60)
 
     if not SOCRATA_APP_TOKEN:
@@ -618,4 +618,4 @@ if __name__ == "__main__":
     print(f"Boroughs: {grid['borough'].value_counts().to_dict()}")
     print("\nProxy divergence summary (high = fragile estimate):")
     print(grid["proxy_divergence"].describe().round(4).to_string())
-    print("\nDone. Run `streamlit run app.py` — it will pick up activity_grid.csv automatically.")
+    print("\nDone. Run `streamlit run app.py` - it will pick up activity_grid.csv automatically.")

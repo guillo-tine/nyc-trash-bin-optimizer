@@ -8,20 +8,20 @@ What this app does, in one sentence:
 
 The whole program is just four steps:
 
-    1. LOAD   – read three kinds of public NYC data:
-                  • activity data  (where people are — a stand-in for foot traffic)
+    1. LOAD   - read three kinds of public NYC data:
+                  • activity data  (where people are - a stand-in for foot traffic)
                   • litter baskets (where bins already exist)
                   • DOT counts     (114 places with REAL measured pedestrian counts)
 
-    2. SCORE  – chop the city into 250m squares ("cells"). Give each cell an
+    2. SCORE  - chop the city into 250m squares ("cells"). Give each cell an
                 "activity score" = how much activity happened inside it. Then for
                 every cell, measure the distance to the nearest existing bin.
 
-    3. FILTER – keep a cell as a SUGGESTION only if it is:
+    3. FILTER - keep a cell as a SUGGESTION only if it is:
                   • busy enough        (activity above the Sensitivity cutoff), AND
                   • far from any bin    (farther than the Minimum-gap setting).
 
-    4. RANK   – give each suggestion a Priority score (0-100) so a city planner
+    4. RANK   - give each suggestion a Priority score (0-100) so a city planner
                 knows which ones to build first, and draw everything on a map.
 
 Read the functions top-to-bottom and they follow those four steps.
@@ -85,7 +85,7 @@ _TO_METERS = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
 
 # ===========================================================================
-# STEP 1 — Load the data
+# STEP 1 - Load the data
 # ===========================================================================
 def download_csv(dataset_id: str, out_path: str) -> None:
     """Download one dataset from NYC Open Data and save it as a CSV file."""
@@ -110,15 +110,15 @@ def load_sources():
     """Load every activity source we have, plus the bins.
 
     Returns three things:
-        proxy  – the good composite grid (or None if it hasn't been built yet)
-        nypd   – the original NYPD incident table (or None)
-        bins   – the existing litter baskets
+        proxy  - the good composite grid (or None if it hasn't been built yet)
+        nypd   - the original NYPD incident table (or None)
+        bins   - the existing litter baskets
     """
     if not os.path.exists(BINS_CSV):
         ensure_data()
     bins = pd.read_csv(BINS_CSV)
 
-    # The composite grid is optional — it only exists after running build_proxy.py.
+    # The composite grid is optional - it only exists after running build_proxy.py.
     proxy = pd.read_csv(PROXY_GRID_CSV) if os.path.exists(PROXY_GRID_CSV) else None
 
     # Only force-download the NYPD data if we have no composite grid to fall back on.
@@ -168,7 +168,7 @@ def activity_input(options, choice, proxy, nypd):
 
 @st.cache_data(show_spinner=False)
 def load_dot_counts() -> pd.DataFrame:
-    """Load the 114 DOT pedestrian-count locations — the only REAL measured
+    """Load the 114 DOT pedestrian-count locations - the only REAL measured
     foot-traffic numbers NYC publishes. We use them as a reality check.
 
     These 114 points basically never change, so we download them ONCE and save
@@ -240,13 +240,13 @@ def pick_lat_lon_columns(df: pd.DataFrame):
     if lat_col and lon_col:
         return df, lat_col, lon_col
 
-    # No plain lat/lon columns — try a geometry/point column instead.
+    # No plain lat/lon columns - try a geometry/point column instead.
     geom_col = find_column(df, {"the_geom", "geom", "geometry", "location", "point"})
     if geom_col:
         text = df[geom_col].astype(str)
         df = df.copy()
         if text.str.contains("POINT", case=False, na=False).any():
-            # WKT format: "POINT (lon lat)"  — note longitude comes first.
+            # WKT format: "POINT (lon lat)"  - note longitude comes first.
             parts = text.str.extract(r"POINT\s*\(\s*([-\d\.]+)\s+([-\d\.]+)\s*\)", expand=True)
             df["_lon"] = pd.to_numeric(parts[0], errors="coerce")
             df["_lat"] = pd.to_numeric(parts[1], errors="coerce")
@@ -288,7 +288,7 @@ def clean_latlon(df: pd.DataFrame, lat_col: str, lon_col: str) -> pd.DataFrame:
 
 
 # ===========================================================================
-# STEP 2 — Score every cell, and measure distance to the nearest bin
+# STEP 2 - Score every cell, and measure distance to the nearest bin
 # ===========================================================================
 @st.cache_data(show_spinner=False)
 def prepare_candidates(ped_df: pd.DataFrame, bins_df: pd.DataFrame):
@@ -307,7 +307,7 @@ def prepare_candidates(ped_df: pd.DataFrame, bins_df: pd.DataFrame):
 
     # --- Build the activity cells ---
     if "activity_score" in ped_df.columns and "lat" in ped_df.columns:
-        # The composite grid is ALREADY one row per cell with a score — just clean it.
+        # The composite grid is ALREADY one row per cell with a score - just clean it.
         cand = ped_df.copy()
         cand["lat"] = pd.to_numeric(cand["lat"], errors="coerce")
         cand["lon"] = pd.to_numeric(cand["lon"], errors="coerce")
@@ -316,7 +316,7 @@ def prepare_candidates(ped_df: pd.DataFrame, bins_df: pd.DataFrame):
         if "borough" not in cand.columns:
             cand["borough"] = assign_borough(cand["lat"], cand["lon"])
     else:
-        # Raw NYPD points — count how many fall into each 250m cell.
+        # Raw NYPD points - count how many fall into each 250m cell.
         ped_df, ped_lat, ped_lon = pick_lat_lon_columns(ped_df)
         if ped_lat is None:
             raise ValueError("Cannot find latitude/longitude in the activity dataset.")
@@ -352,7 +352,7 @@ def prepare_candidates(ped_df: pd.DataFrame, bins_df: pd.DataFrame):
 
 
 # ===========================================================================
-# STEP 3 — Filter cells down to suggestions
+# STEP 3 - Filter cells down to suggestions
 # ===========================================================================
 def suggest_new_bins(cand: pd.DataFrame, threshold_index: int,
                      min_distance_m: float, borough: str) -> pd.DataFrame:
@@ -378,15 +378,15 @@ def suggest_new_bins(cand: pd.DataFrame, threshold_index: int,
 
 
 # ===========================================================================
-# STEP 4 — Rank suggestions by priority (which to build first)
+# STEP 4 - Rank suggestions by priority (which to build first)
 # ===========================================================================
 def compute_priority(sugg: pd.DataFrame, dot_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """Give each suggestion a 0-100 Priority score and sort by it.
 
     Priority blends three ideas:
-        • activity   – how busy the cell is        (the activity index, 0-100)
-        • gap        – how far the nearest bin is   (ranked 0-100 among suggestions)
-        • dot        – is it near a high REAL DOT count?  (a small confidence bonus)
+        • activity   - how busy the cell is        (the activity index, 0-100)
+        • gap        - how far the nearest bin is   (ranked 0-100 among suggestions)
+        • dot        - is it near a high REAL DOT count?  (a small confidence bonus)
 
     With DOT data:    priority = 0.55*activity + 0.35*gap + 0.10*dot
     Without DOT data: priority = 0.60*activity + 0.40*gap
@@ -449,7 +449,7 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
     center_lat, center_lon, zoom = BOROUGH_CENTERS.get(borough, BOROUGH_CENTERS["All Boroughs"])
     fmap = folium.Map(location=[center_lat, center_lon], zoom_start=zoom, tiles="cartodbpositron")
 
-    # Activity heatmap (drawn first, underneath everything) — shows the raw activity
+    # Activity heatmap (drawn first, underneath everything) - shows the raw activity
     # surface that feeds the whole model. Each cell is weighted by its activity score.
     if show_all and cells_df is not None and len(cells_df):
         from folium.plugins import HeatMap
@@ -511,8 +511,8 @@ st.set_page_config(page_title="NYC Trash Bin Optimizer", layout="wide")
 
 st.title("NYC Trash Bin Optimizer")
 st.caption(
-    "Flags city blocks where public trash bins are most likely needed — places with high "
-    "local activity but poor existing bin coverage, using NYC's own public data."
+    "This map points out blocks that might need more public trash bins. It looks for areas "
+    "that are busy but don't have many bins nearby, all using the city's public data."
 )
 
 # Load the data first so the dropdown can list whichever sources exist.
@@ -539,11 +539,11 @@ with st.sidebar:
         "Activity data source",
         list(source_options.keys()),
         help=(
-            "Which signal to use as a stand-in for where people are.\n\n"
-            "**Composite** blends 311 + transit (best).\n\n"
-            "**311 / Subway / Citibike** isolate one signal.\n\n"
-            "**NYPD incidents** is the original (weak in quiet residential areas).\n\n"
-            "Build more sources by running `python data/build_proxy.py`."
+            "Pick which data stands in for where people are.\n\n"
+            "**Composite** mixes 311 and transit, and is the best option.\n\n"
+            "**311, Subway, or Citibike** each use a single signal.\n\n"
+            "**NYPD incidents** is the original, and it misses quiet residential areas.\n\n"
+            "To add more sources, run `python data/build_proxy.py`."
         ),
     )
 
@@ -551,9 +551,9 @@ with st.sidebar:
         "Borough",
         ["All Boroughs", "Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"],
         help=(
-            "Focus recommendations on one borough. Activity is ranked within the "
-            "selected borough, so quieter boroughs like Queens are judged against "
-            "themselves — not against dense Manhattan."
+            "Focus on one borough. Activity is ranked inside the borough you pick, so "
+            "quieter boroughs like Queens get compared to themselves instead of to "
+            "crowded Manhattan."
         ),
     )
 
@@ -562,37 +562,37 @@ with st.sidebar:
     sensitivity = st.slider(
         "Sensitivity", min_value=1, max_value=10, value=5,
         help=(
-            "How active an area must be before it's flagged.\n\n"
-            "**Low (1–3):** only the very busiest spots — fewest, highest-confidence picks.\n\n"
-            "**Medium (5):** balanced.\n\n"
-            "**High (8–10):** includes moderately active areas — more, broader picks."
+            "How busy an area has to be before it gets flagged.\n\n"
+            "**Low (1 to 3):** only the busiest spots, so you get fewer but stronger picks.\n\n"
+            "**Medium (5):** a balance.\n\n"
+            "**High (8 to 10):** also includes moderately busy areas, so you get more picks."
         ),
     )
 
     min_distance_m = st.slider(
         "Minimum gap from existing bin (meters)", min_value=25, max_value=800, value=300, step=25,
         help=(
-            "A spot is only suggested if no existing bin is within this distance.\n\n"
-            "**300 m ≈ 1 city block.** Larger = only the most isolated gaps."
+            "A spot is only suggested if there's no bin within this distance.\n\n"
+            "**300 m is about one city block.** Raise it to find only the most isolated gaps."
         ),
     )
 
     show_dot = st.checkbox(
         "Show DOT verified pedestrian counts", value=False,
         help=(
-            "Overlays the 114 NYC DOT count locations as blue circles, sized by measured "
-            "pedestrian volume. These are the only verified foot-traffic numbers the city "
-            "publishes — useful as a reality check on the activity estimate."
+            "Shows the 114 NYC DOT count locations as blue circles, sized by how many "
+            "pedestrians were measured. These are the only real foot-traffic counts the city "
+            "publishes, so they make a good reality check."
         ),
     )
 
     show_all = st.checkbox(
         "Visualize everything", value=False,
         help=(
-            "Adds an **activity heatmap** of every cell (the raw signal the whole tool is "
-            "built on) and draws ALL existing bins and ALL suggestions, not just the top ones.\n\n"
-            "Great for seeing the full picture. Tip: pick a single borough — drawing the whole "
-            "city at full detail can make the map slow."
+            "Adds a heatmap of activity across every cell (the raw signal behind the whole "
+            "tool) and draws every bin and every suggestion, not just the top ones.\n\n"
+            "Good for seeing the full picture. Tip: pick one borough, since drawing the whole "
+            "city at full detail can get slow."
         ),
     )
 
@@ -631,14 +631,14 @@ left, right = st.columns([2, 1], gap="large")
 
 with left:
     st.subheader("Coverage Map")
-    legend = "Red = existing bins  |  Green = suggested new locations (brightest = highest priority)"
+    legend = "Red dots are existing bins. Green dots are suggested new spots (brighter means higher priority)."
     if show_dot and len(dot_scope):
-        legend += "  |  Blue = DOT verified pedestrian counts"
+        legend += " Blue circles are DOT pedestrian counts."
     if show_all:
-        legend += "  |  Heat = activity level"
-    st.caption(legend + "  — click any marker for details")
+        legend += " The heat shows activity level."
+    st.caption(legend + " Click any dot for details.")
     if show_all:
-        st.caption("Visualize-everything mode: activity heatmap + all bins + all suggestions shown.")
+        st.caption("Showing everything: the activity heatmap, all bins, and all suggestions.")
         if borough == "All Boroughs":
             st.caption("Tip: pick a single borough if the full-city view feels slow.")
     elif len(suggested) > MAP_SUGG_CAP:
@@ -666,40 +666,42 @@ with right:
     st.divider()
     st.caption("**How it works**")
     st.caption(
-        f"The city is split into **250 m × 250 m cells**. Each cell gets an **activity index "
-        f"(0–100)** ranking it against others in the current view. A cell is suggested when its "
-        f"index is **≥ {threshold_index}** *and* the nearest existing bin is more than "
-        f"**{min_distance_m} m** away."
+        f"The city is split into **250 m by 250 m squares**. Each square gets an **activity "
+        f"score from 0 to 100** based on how it ranks against the others in view. A square is "
+        f"suggested when its score is at least **{threshold_index}** and the nearest bin is more "
+        f"than **{min_distance_m} m** away."
     )
 
     st.divider()
-    st.caption(f"**About the data — {source_choice}**")
+    st.caption(f"**About the data: {source_choice}**")
     composite_desc = (
-        "A blend of " + " and ".join(composite_layers) + " — a proxy for where people are on foot."
+        "This mixes " + " and ".join(composite_layers) + " to estimate where people are walking."
         if composite_layers else
-        "A blend of NYC activity signals — a proxy for where people are on foot."
+        "This mixes several NYC activity signals to estimate where people are walking."
     )
     SOURCE_BLURBS = {
         "Composite (311 + transit)": composite_desc,
-        "311 street complaints": "Counts of outdoor 311 complaints (street/sidewalk conditions, "
-            "litter, noise). Dense in residential areas where NYPD data is blind.",
-        "Subway ridership": "MTA hourly ridership totals per station. Strong near transit, "
-            "weaker away from stations.",
-        "Citibike trips": "Citibike trip start/end counts per station. Good within the system "
-            "footprint, absent outside it.",
-        "NYPD incidents (911 calls)": "NYPD incident records used as a foot-traffic proxy. "
-            "Over-weights commercial corridors and is weak in quiet residential blocks.",
+        "311 street complaints": "Counts of outdoor 311 reports like street and sidewalk "
+            "conditions, litter, and noise. These are common in residential areas, where the "
+            "NYPD data falls short.",
+        "Subway ridership": "How many people ride the subway at each station. It's strong near "
+            "stations and weaker once you move away from them.",
+        "Citibike trips": "How many Citibike trips start or end at each station. It's useful "
+            "inside the bike network but doesn't cover areas without stations.",
+        "NYPD incidents (911 calls)": "NYPD incident records, used as a stand-in for foot "
+            "traffic. It leans toward commercial streets and tends to miss quiet residential blocks.",
     }
     st.caption(SOURCE_BLURBS.get(source_choice, ""))
     if proxy_df is None:
-        st.caption("Run `python data/build_proxy.py` to add the richer 311/transit sources.")
+        st.caption("Run `python data/build_proxy.py` to add the 311 and transit sources.")
 
     if len(suggested) > 0:
         st.divider()
-        st.caption("**Priority list — build these first**")
+        st.caption("**Priority list (build these first)**")
         st.caption(
-            "Priority (0–100) blends how busy the area is, how far the nearest bin is, "
-            + ("and how close it sits to a verified DOT count." if len(dot_all) else "and coverage gap.")
+            "The priority score (0 to 100) combines how busy a spot is and how far it is from "
+            "the nearest bin"
+            + (", plus whether a real DOT pedestrian count is nearby." if len(dot_all) else ".")
         )
 
         # Build a friendly, human-readable version of the table.

@@ -1,5 +1,5 @@
 # Extra packages needed ONLY to run the offline data builder (data/build_proxy.py).
-# The web app does not need these — install them locally if you rebuild the grid.
+# The web app does not need these - install them locally if you rebuild the grid.
 -r requirements.txt
 geopandas>=0.14
 shapely>=2.0
