@@ -139,6 +139,14 @@ def build_source_options(proxy, nypd):
     if proxy is not None:
         # The composite grid carries several columns; each can be used on its own.
         options["Composite (311 + transit)"] = ("proxy", "activity_score")
+
+        # Per-person version: only offered if the population denominator (LODES) was
+        # actually built into the grid. It scores activity-per-person instead of raw
+        # volume, which corrects for crowd-size bias.
+        has_pop = "lodes_pop" in proxy.columns and pd.to_numeric(proxy["lodes_pop"], errors="coerce").fillna(0).sum() > 0
+        if "composite_perperson" in proxy.columns and has_pop:
+            options["Composite (per person)"] = ("proxy", "composite_perperson")
+
         for label, column in [("311 street complaints", "score_311"),
                               ("Subway ridership", "score_mta"),
                               ("Citibike trips", "score_citibike")]:
@@ -681,6 +689,10 @@ with right:
     )
     SOURCE_BLURBS = {
         "Composite (311 + transit)": composite_desc,
+        "Composite (per person)": "The same blend, but divided by how many people work and "
+            "live nearby (from Census LODES). This scores activity per person instead of raw "
+            "crowd size, so a packed transit hub doesn't automatically outrank a quieter "
+            "but underserved neighborhood.",
         "311 street complaints": "Counts of outdoor 311 reports like street and sidewalk "
             "conditions, litter, and noise. These are common in residential areas, where the "
             "NYPD data falls short.",

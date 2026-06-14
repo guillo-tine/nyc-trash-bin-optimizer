@@ -61,7 +61,7 @@ EQUITY_FLOOR_PCT = 0.05       # populated squares never score below the 5th perc
 
 # How much data to pull / which optional steps to run.
 LIMIT_311    = 150_000                                  # number of 311 complaints to download
-ENABLE_LODES = os.environ.get("ENABLE_LODES", "0") == "1"   # heavy census step; off unless asked
+ENABLE_LODES = os.environ.get("ENABLE_LODES", "1") == "1"   # population denominator; on by default
 DOT_DATASET  = "cqsj-cfgu"                              # the real DOT counts table
 
 # NYC Open Data lives on two portals (city + state).
@@ -367,105 +367,85 @@ def fetch_dot_counts() -> pd.DataFrame:
 
 
 # ===========================================================================
-# Source 5 - LODES population (optional density correction, OFF by default)
+# Source 5 - LODES population (the denominator: how many people are present)
 # ===========================================================================
-# This downloads Census files to estimate how many people live/work in each square,
-# so busy-because-crowded areas don't automatically dominate. It's heavy and flaky,
-# so it's skipped unless you set ENABLE_LODES=1.
-LODES_BASE  = "https://lehd.ces.census.gov/data/lodes/LODES8/ny"
-TIGER_BASE  = "https://www2.census.gov/geo/tiger/TIGER2020/TABBLOCK20"
-LODES_YEARS = [2021, 2020, 2019]   # try newest first
+# Census LEHD LODES gives jobs-per-block (daytime) and residents-per-block
+# (nighttime). We use jobs + residents as a behavior-independent population count,
+# so the proxies can be measured as activity PER PERSON instead of raw volume.
+# LODES counts are privacy-fuzzed at the block level, so we aggregate up to block
+# group (the first 12 digits of the 15-digit census GEOID) to smooth them, then
+# join to TIGER 2020 block-group center points to get lat/lon.
+LODES_BASE   = "https://lehd.ces.census.gov/data/lodes/LODES8/ny"
+TIGER_BG_URL = "https://www2.census.gov/geo/tiger/TIGER2020/BG/tl_2020_36_bg.zip"  # all of NY state
+LODES_YEAR   = 2022
 
 def fetch_lodes_denominator() -> pd.Series:
-    """Population (daytime jobs + nighttime residents) summed per 250m square."""
+    """Population (daytime jobs + nighttime residents) summed per 250m square.
+
+    Returns a Series indexed by (grid_x, grid_y), named lodes_pop. Empty on failure.
+    """
     cache_path = CACHE_DIR / "lodes_grid.parquet"
     if cache_path.exists():
         log("Cache hit: lodes_grid")
         return pd.read_parquet(cache_path).set_index(["grid_x", "grid_y"])["lodes_pop"]
 
-    # --- Get the geographic center of every census block in the 5 boroughs ---
-    log("Downloading TIGER/Line 2020 block shapefiles (5 counties)...")
-    block_frames = []
-    for fips, boro in BOROUGH_FIPS.items():
-        tiger_cache = CACHE_DIR / f"tiger_{fips}.parquet"
-        if tiger_cache.exists():
-            block_frames.append(gpd.read_parquet(tiger_cache))
-            continue
-        log(f"  Fetching {boro} blocks...")
-        response = requests.get(f"{TIGER_BASE}/tl_2020_{fips}_tabblock20.zip", timeout=300)
-        response.raise_for_status()
-        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-            zf.extractall(CACHE_DIR / f"tiger_{fips}")
-        shp_path = next((CACHE_DIR / f"tiger_{fips}").glob("*.shp"))
-        blocks = gpd.read_file(shp_path)[["GEOID20", "geometry"]]
-        blocks["centroid"] = blocks.geometry.centroid
-        blocks["lat"] = blocks["centroid"].y
-        blocks["lon"] = blocks["centroid"].x
-        blocks = blocks.drop(columns=["geometry", "centroid"])
-        blocks.to_parquet(tiger_cache, index=False)
-        block_frames.append(blocks)
+    boroughs = set(BOROUGH_FIPS)   # the 5 borough county prefixes
 
-    tiger_df = pd.concat(block_frames, ignore_index=True).rename(columns={"GEOID20": "geocode"})
-    log(f"  {len(tiger_df):,} block centroids loaded")
-
-    # --- Download the LODES job/worker counts per block ---
-    def download_lodes(kind: str) -> pd.DataFrame:
-        for year in LODES_YEARS:
-            fname = f"ny_{kind}_S000_JT00_{year}.csv.gz"
-            lodes_cache = CACHE_DIR / fname
-            if lodes_cache.exists():
-                log(f"  Cache hit: {fname}")
-                return pd.read_csv(lodes_cache, dtype={"w_geocode": str, "h_geocode": str})
+    def lodes_by_block_group(kind, value_name):
+        # kind "wac" = jobs at workplace (daytime); "rac" = workers by home (nighttime)
+        fname = f"ny_{kind}_S000_JT00_{LODES_YEAR}.csv.gz"
+        cache = CACHE_DIR / fname
+        if cache.exists():
+            log(f"  Cache hit: {fname}")
+            raw = cache.read_bytes()
+        else:
             log(f"  Downloading {fname}...")
-            try:
-                response = requests.get(f"{LODES_BASE}/{kind}/{fname}", timeout=300)
-                if response.status_code != 200:
-                    continue
-                with open(lodes_cache, "wb") as f:
-                    f.write(response.content)
-                return pd.read_csv(lodes_cache, dtype={"w_geocode": str, "h_geocode": str})
-            except Exception as e:
-                log(f"    Failed ({e}), trying older year...")
-        return pd.DataFrame()
+            r = requests.get(f"{LODES_BASE}/{kind}/{fname}", timeout=300)
+            r.raise_for_status()
+            cache.write_bytes(r.content)
+            raw = r.content
+        geo = "w_geocode" if kind == "wac" else "h_geocode"
+        df = pd.read_csv(io.BytesIO(raw), compression="gzip", dtype={geo: str})
+        df[geo] = df[geo].str.zfill(15)
+        df = df[df[geo].str[:5].isin(boroughs)]   # keep the 5 boroughs
+        df["bg"] = df[geo].str[:12]               # first 12 digits = block group
+        return df.groupby("bg")["C000"].sum().rename(value_name).reset_index()
 
-    log("Downloading LODES WAC (workplace) and RAC (residence)...")
-    wac = download_lodes("wac")   # jobs at workplace = daytime population
-    rac = download_lodes("rac")   # workers by home    = nighttime population
+    try:
+        jobs = lodes_by_block_group("wac", "jobs")
+        residents = lodes_by_block_group("rac", "residents")
 
-    if wac.empty and rac.empty:
-        log("  WARNING: Could not fetch LODES data. Denominator will be skipped.")
+        # TIGER block-group center points for NY, then keep the 5 boroughs.
+        zcache = CACHE_DIR / "tiger_bg_36.zip"
+        if not zcache.exists():
+            log("  Downloading TIGER 2020 block groups (NY state)...")
+            r = requests.get(TIGER_BG_URL, timeout=300)
+            r.raise_for_status()
+            zcache.write_bytes(r.content)
+        zdir = CACHE_DIR / "tiger_bg_36"
+        if not zdir.exists():
+            with zipfile.ZipFile(zcache) as zf:
+                zf.extractall(zdir)
+        shp = next(zdir.glob("*.shp"))
+        bg = gpd.read_file(shp)
+        geoid = "GEOID" if "GEOID" in bg.columns else next(c for c in bg.columns if c.upper().startswith("GEOID"))
+        bg = bg[[geoid, "geometry"]].rename(columns={geoid: "bg"})
+        bg = bg[bg["bg"].str[:5].isin(boroughs)].to_crs("EPSG:4326")
+        centers = bg.geometry.centroid
+        bg = pd.DataFrame({"bg": bg["bg"].values, "lat": centers.y.values, "lon": centers.x.values})
+
+        # Attach jobs + residents to each block-group center, then sum into the grid.
+        merged = bg.merge(jobs, on="bg", how="left").merge(residents, on="bg", how="left").fillna(0)
+        merged["lodes_pop"] = merged["jobs"] + merged["residents"]
+        cells = to_grid_cells(merged["lat"], merged["lon"], weight=merged["lodes_pop"])
+        grid_pop = aggregate_to_grid(cells).rename("lodes_pop")
+
+        grid_pop.reset_index().to_parquet(cache_path, index=False)
+        log(f"  LODES grid: {len(grid_pop):,} cells, {merged['lodes_pop'].sum():,.0f} day+night people")
+        return grid_pop
+    except Exception as e:
+        log(f"WARNING: LODES denominator failed ({e}). Skipping.")
         return pd.Series(dtype=float, name="lodes_pop")
-
-    # Sum jobs and residents per block (restricted to the 5 boroughs).
-    joined = []
-    if not wac.empty:
-        wac["w_geocode"] = wac["w_geocode"].astype(str).str.zfill(15)
-        wac = wac[wac["w_geocode"].str[:5].isin(BOROUGH_FIPS)]
-        wac_by_block = wac.groupby("w_geocode")["C000"].sum().reset_index()
-        wac_by_block.columns = ["geocode", "wac_jobs"]
-        joined.append(wac_by_block)
-    if not rac.empty:
-        rac["h_geocode"] = rac["h_geocode"].astype(str).str.zfill(15)
-        rac = rac[rac["h_geocode"].str[:5].isin(BOROUGH_FIPS)]
-        rac_by_block = rac.groupby("h_geocode")["C000"].sum().reset_index()
-        rac_by_block.columns = ["geocode", "rac_workers"]
-        joined.append(rac_by_block)
-
-    # Attach the counts to each block's center point, then sum into the grid.
-    merged = tiger_df.copy()
-    for frame in joined:
-        merged = merged.merge(frame, on="geocode", how="left")
-    merged = merged.fillna(0)
-    pop_cols = [c for c in merged.columns if c in ("wac_jobs", "rac_workers")]
-    merged["lodes_pop"] = merged[pop_cols].sum(axis=1)
-
-    valid = merged.dropna(subset=["lat", "lon"])
-    cells = to_grid_cells(valid["lat"], valid["lon"], weight=valid["lodes_pop"])
-    grid_pop = aggregate_to_grid(cells).rename("lodes_pop")
-
-    grid_pop.reset_index().to_parquet(cache_path, index=False)
-    log(f"  LODES grid: {len(grid_pop):,} cells")
-    return grid_pop
 
 
 # ===========================================================================
@@ -537,32 +517,43 @@ def build_grid() -> pd.DataFrame:
     grid["score_citibike"] = score_citibike.reindex(index, fill_value=0) if not score_citibike.empty else 0.0
     grid["lodes_pop"]      = lodes.reindex(index, fill_value=0)
 
-    # --- Optionally divide by population so we measure activity-per-person, not raw crowd ---
-    # (+1 avoids dividing by zero; with LODES off, lodes_pop is 0 so this leaves scores as-is.)
+    # --- Raw composite: the weighted blend of raw scores. This is the app's default
+    #     activity score (unchanged from before). MTA weighted highest (real measured
+    #     riders), then Citibike, then 311 as the dense base. ---
+    grid["composite_raw"] = (
+        1.0 * grid["score_311"] +
+        2.0 * grid["score_mta"] +
+        1.5 * grid["score_citibike"]
+    )
+
+    # --- Per-person composite: divide each source by population FIRST, so a square is
+    #     scored on activity-per-person, not raw crowd. This is the bias correction;
+    #     the app offers it as a separate source so a demo can compare raw vs per-person.
+    #     (+1 avoids dividing by zero. If LODES is unavailable, lodes_pop is 0 and this
+    #     equals the raw composite.) ---
     denominator = grid["lodes_pop"] + 1
     grid["norm_311"]      = grid["score_311"]      / denominator
     grid["norm_mta"]      = grid["score_mta"]      / denominator
     grid["norm_citibike"] = grid["score_citibike"] / denominator
-
-    # --- The composite recipe: a weighted blend of the (normalized) sources ---
-    # MTA is weighted highest (real measured riders), then Citibike, then 311 as the base.
-    grid["composite"] = (
+    grid["composite_perperson"] = (
         1.0 * grid["norm_311"] +
         2.0 * grid["norm_mta"] +
         1.5 * grid["norm_citibike"]
     )
 
-    # --- How much the sources disagree in each square (high = less trustworthy) ---
-    grid["proxy_divergence"] = grid[["norm_311", "norm_mta", "norm_citibike"]].std(axis=1)
-
-    # --- Fairness floor: a populated square never scores below the 5th percentile ---
+    # --- Fairness floor (applied to the per-person score): a populated square never
+    #     drops below the 5th percentile, so inhabited areas are not starved by gaps
+    #     in correlated proxies. ---
     inhabited = grid["lodes_pop"] > 0
     if inhabited.any():
-        floor_value = float(grid.loc[inhabited, "composite"].quantile(EQUITY_FLOOR_PCT))
-        grid.loc[inhabited & (grid["composite"] < floor_value), "composite"] = floor_value
-        grid["equity_floored"] = inhabited & (grid["composite"] <= floor_value)
+        floor_value = float(grid.loc[inhabited, "composite_perperson"].quantile(EQUITY_FLOOR_PCT))
+        grid.loc[inhabited & (grid["composite_perperson"] < floor_value), "composite_perperson"] = floor_value
+        grid["equity_floored"] = inhabited & (grid["composite_perperson"] <= floor_value)
     else:
         grid["equity_floored"] = False
+
+    # --- How much the sources disagree per square (high = fragile estimate) ---
+    grid["proxy_divergence"] = grid[["norm_311", "norm_mta", "norm_citibike"]].std(axis=1)
 
     # --- Turn each square's (grid_x, grid_y) back into a real lat/lon center point ---
     from pyproj import Transformer
@@ -584,8 +575,8 @@ def build_grid() -> pd.DataFrame:
     # Attach the DOT reality-check column.
     grid["dot_calibration"] = dot_calibration_flag(grid, dot_df).values
 
-    # The app reads "activity_score" - that's just our composite.
-    grid["activity_score"] = grid["composite"]
+    # The app reads "activity_score" by default - that's the raw composite (unchanged).
+    grid["activity_score"] = grid["composite_raw"]
 
     log(f"Grid complete: {len(grid):,} cells across NYC")
     return grid
@@ -607,7 +598,7 @@ if __name__ == "__main__":
 
     # Save only the columns the app + diagnostics need (this column order is fixed).
     keep_cols = [
-        "lat", "lon", "borough", "activity_score",
+        "lat", "lon", "borough", "activity_score", "composite_perperson",
         "score_311", "score_mta", "score_citibike",
         "lodes_pop", "proxy_divergence", "equity_floored", "dot_calibration",
     ]
