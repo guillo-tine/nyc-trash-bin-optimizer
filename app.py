@@ -356,6 +356,10 @@ def prepare_candidates(ped_df: pd.DataFrame, bins_df: pd.DataFrame):
         cand["nearest_bin_m"] = np.inf
 
     keep = ["lat", "lon", "borough", "activity_score", "nearest_bin_m"]
+    # Carry DSNY-eligibility columns through if the grid has them (composite sources).
+    for extra in ("eligible", "commercial_area"):
+        if extra in cand.columns:
+            keep.append(extra)
     return cand[keep].reset_index(drop=True), bins.reset_index(drop=True)
 
 
@@ -363,10 +367,20 @@ def prepare_candidates(ped_df: pd.DataFrame, bins_df: pd.DataFrame):
 # STEP 3 - Filter cells down to suggestions
 # ===========================================================================
 def suggest_new_bins(cand: pd.DataFrame, threshold_index: int,
-                     min_distance_m: float, borough: str) -> pd.DataFrame:
-    """Keep only the cells that are busy enough AND far enough from a bin."""
+                     min_distance_m: float, borough: str,
+                     eligible_only: bool = False) -> pd.DataFrame:
+    """Keep only the cells that are busy enough AND far enough from a bin.
+
+    If eligible_only is True and the grid carries an 'eligible' column, the DSNY
+    eligibility gate (commercial/transit land use) is applied FIRST, before scoring.
+    """
     # If a borough is chosen, look only at that borough's cells.
     cells = cand if borough == "All Boroughs" else cand[cand["borough"] == borough]
+
+    # DSNY eligibility gate: a hard filter applied before the busy/far tests.
+    if eligible_only and "eligible" in cells.columns:
+        cells = cells[cells["eligible"]]
+
     if cells.empty:
         return cells.assign(activity_index=pd.Series(dtype=int))
 
@@ -585,6 +599,18 @@ with st.sidebar:
         ),
     )
 
+    apply_gate = st.checkbox(
+        "Apply DSNY eligibility rules", value=False,
+        help=(
+            "DSNY only places baskets on commercial or mixed-use corners and near transit, "
+            "not on residential or industrial streets, in parks, or mid-block. With this on, "
+            "a cell is suggested only if it has commercial/mixed-use land use or sits near a "
+            "subway entrance, and is not dominated by parks, industrial, or highway land. "
+            "(Eligibility uses NYC PLUTO land use and MTA subway entrances.) "
+            "This is off by default so you can show the before/after."
+        ),
+    )
+
     show_dot = st.checkbox(
         "Show DOT verified pedestrian counts", value=False,
         help=(
@@ -624,7 +650,8 @@ dot_all = load_dot_counts()
 #   sensitivity 10 -> cutoff 0  (every cell passes the busyness test)
 threshold_index = (10 - sensitivity) * 10
 
-suggested = suggest_new_bins(cand_df, threshold_index, float(min_distance_m), borough)
+suggested = suggest_new_bins(cand_df, threshold_index, float(min_distance_m), borough,
+                             eligible_only=apply_gate)
 suggested = compute_priority(suggested, dot_all if len(dot_all) else None)
 
 # What to show on the map for the chosen borough (existing bins + DOT points).
@@ -645,6 +672,13 @@ with left:
     if show_all:
         legend += " The heat shows activity level."
     st.caption(legend + " Click any dot for details.")
+    if apply_gate:
+        if "eligible" in cand_df.columns:
+            st.caption("DSNY eligibility rules are ON: showing only commercial or transit-eligible "
+                       "corners (residential, parks, industrial, and highway cells are removed).")
+        else:
+            st.caption("DSNY eligibility rules need a Composite source (PLUTO land use); they don't "
+                       "apply to the NYPD source.")
     if show_all:
         st.caption("Showing everything: the activity heatmap, all bins, and all suggestions.")
         if borough == "All Boroughs":

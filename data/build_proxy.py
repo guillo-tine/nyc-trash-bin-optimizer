@@ -64,6 +64,17 @@ LIMIT_311    = 150_000                                  # number of 311 complain
 ENABLE_LODES = os.environ.get("ENABLE_LODES", "1") == "1"   # population denominator; on by default
 DOT_DATASET  = "cqsj-cfgu"                              # the real DOT counts table
 
+# DSNY eligibility gate (land use + transit). The app decides whether to USE it;
+# this just computes the columns into the grid.
+ENABLE_ELIGIBILITY = os.environ.get("ENABLE_ELIGIBILITY", "1") == "1"
+PLUTO_DATASET      = "64uk-42ks"   # tabular PLUTO: land use per tax lot
+SUBWAY_ENTRANCES   = "i9wp-a4ja"   # MTA subway entrances (data.ny.gov)
+TRANSIT_BUFFER_M   = 400           # our own choice (DSNY publishes no buffer); ~quarter mile
+# PLUTO LandUse codes used by the gate:
+ELIGIBLE_LU      = {4, 5}          # 04 mixed residential+commercial, 05 commercial+office
+INSTITUTIONAL_LU = {8}             # 08 public facilities/institutions (hospitals, schools)
+EXCLUDED_LU      = {6, 7, 9, 10}   # industrial, transport/utility (highways), parks/open space, parking
+
 # NYC Open Data lives on two portals (city + state).
 SOCRATA_CITY  = "https://data.cityofnewyork.us/resource"
 SOCRATA_STATE = "https://data.ny.gov/resource"
@@ -449,6 +460,125 @@ def fetch_lodes_denominator() -> pd.Series:
 
 
 # ===========================================================================
+# Source 6 - Land use + transit (the DSNY eligibility gate)
+# ===========================================================================
+# DSNY places baskets on commercial / mixed-use corners or near transit, and NOT
+# on residential or industrial streets, in parks, or mid-block. We approximate that
+# rule at the 250m-cell level using PLUTO land use plus subway-entrance proximity.
+def fetch_pluto() -> pd.DataFrame:
+    """Every tax lot's land use, location, and commercial floor area (paginated, cached)."""
+    cache = CACHE_DIR / "pluto.parquet"
+    if cache.exists():
+        log("Cache hit: pluto")
+        return pd.read_parquet(cache)
+    cols = "landuse,latitude,longitude,lotarea,retailarea,officearea"
+    frames, page = [], 250_000
+    for offset in range(0, 1_000_000, page):
+        log(f"  Downloading PLUTO lots (offset {offset:,})...")
+        r = requests.get(f"{SOCRATA_CITY}/{PLUTO_DATASET}.csv",
+                         params={"$select": cols, "$limit": page, "$offset": offset, "$order": ":id"}, timeout=300)
+        r.raise_for_status()
+        chunk = pd.read_csv(io.StringIO(r.text))
+        if chunk.empty:
+            break
+        frames.append(chunk)
+        if len(chunk) < page:
+            break
+    df = pd.concat(frames, ignore_index=True)
+    for c in cols.split(","):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["latitude", "longitude", "landuse"])
+    df.to_parquet(cache, index=False)
+    log(f"  PLUTO: {len(df):,} lots cached")
+    return df
+
+
+def fetch_subway_entrances() -> pd.DataFrame:
+    """Subway entrance lat/lon (cached) - used for the 'near transit' condition."""
+    cache = CACHE_DIR / "subway_entrances.parquet"
+    if cache.exists():
+        log("Cache hit: subway_entrances")
+        return pd.read_parquet(cache)
+    try:
+        r = requests.get(f"{SOCRATA_STATE}/{SUBWAY_ENTRANCES}.csv",
+                         params={"$select": "entrance_latitude,entrance_longitude", "$limit": 5000}, timeout=60)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text)).rename(
+            columns={"entrance_latitude": "lat", "entrance_longitude": "lon"})
+        df = df.apply(pd.to_numeric, errors="coerce").dropna()
+        df.to_parquet(cache, index=False)
+        log(f"  Subway entrances: {len(df):,}")
+        return df
+    except Exception as e:
+        log(f"  WARNING: subway entrances failed ({e}).")
+        return pd.DataFrame(columns=["lat", "lon"])
+
+
+def add_eligibility(grid: pd.DataFrame) -> pd.DataFrame:
+    """Add DSNY-eligibility columns to the grid: eligible, near_transit, commercial_area.
+
+    A cell is eligible when it has commercial/mixed-use land use OR sits near a subway
+    entrance OR contains an institution, AND it is not dominated by parks, industrial,
+    highway, or parking land. (commercial_area is also kept here for the priority term.)
+    """
+    from pyproj import Transformer
+    from scipy.spatial import cKDTree
+    to_m = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+
+    try:
+        pluto = fetch_pluto()
+        entrances = fetch_subway_entrances()
+    except Exception as e:
+        log(f"WARNING: eligibility inputs failed ({e}). Marking all cells eligible.")
+        grid["eligible"] = True
+        grid["near_transit"] = False
+        grid["commercial_area"] = 0.0
+        return grid
+
+    # Snap each lot to its 250m cell and summarize land use per cell.
+    lx, ly = to_m.transform(pluto["longitude"].values, pluto["latitude"].values)
+    pluto = pluto.assign(
+        gx=np.floor(lx / GRID_SIZE_M).astype(int),
+        gy=np.floor(ly / GRID_SIZE_M).astype(int),
+        is_comm=pluto["landuse"].isin(ELIGIBLE_LU),
+        is_inst=pluto["landuse"].isin(INSTITUTIONAL_LU),
+        lot_area=pluto["lotarea"].fillna(0),
+    )
+    pluto["excl_area"] = np.where(pluto["landuse"].isin(EXCLUDED_LU), pluto["lot_area"], 0.0)
+    pluto["comm_area"] = pluto["retailarea"].fillna(0) + pluto["officearea"].fillna(0)
+    cell = pluto.groupby(["gx", "gy"]).agg(
+        has_comm=("is_comm", "max"),
+        has_inst=("is_inst", "max"),
+        excl_area=("excl_area", "sum"),
+        tot_area=("lot_area", "sum"),
+        commercial_area=("comm_area", "sum"),
+    ).reset_index()
+    cell["dominant_excluded"] = (cell["tot_area"] > 0) & (cell["excl_area"] > 0.5 * cell["tot_area"])
+
+    grid = grid.merge(cell, left_on=["grid_x", "grid_y"], right_on=["gx", "gy"], how="left")
+    for c in ["has_comm", "has_inst", "dominant_excluded"]:
+        grid[c] = grid[c].fillna(False).astype(bool)
+    grid["commercial_area"] = grid["commercial_area"].fillna(0.0)
+
+    # near transit: each cell center within the buffer of any subway entrance
+    if len(entrances):
+        ex, ey = to_m.transform(entrances["lon"].values, entrances["lat"].values)
+        tree = cKDTree(np.column_stack([ex, ey]))
+        cx = grid["grid_x"].values * GRID_SIZE_M + GRID_SIZE_M / 2
+        cy = grid["grid_y"].values * GRID_SIZE_M + GRID_SIZE_M / 2
+        dist, _ = tree.query(np.column_stack([cx, cy]), k=1)
+        grid["near_transit"] = dist <= TRANSIT_BUFFER_M
+    else:
+        grid["near_transit"] = False
+
+    grid["eligible"] = (grid["has_comm"] | grid["has_inst"] | grid["near_transit"]) & (~grid["dominant_excluded"])
+    grid = grid.drop(columns=["gx", "gy", "has_comm", "has_inst", "excl_area", "tot_area", "dominant_excluded"],
+                     errors="ignore")
+    log(f"  Eligibility: {int(grid['eligible'].sum()):,}/{len(grid):,} cells pass the DSNY gate")
+    return grid
+
+
+# ===========================================================================
 # DOT reality-check column (diagnostic only - not used to place bins)
 # ===========================================================================
 def dot_calibration_flag(grid_df: pd.DataFrame, dot_df: pd.DataFrame) -> pd.Series:
@@ -572,6 +702,15 @@ def build_grid() -> pd.DataFrame:
     # Keep only squares that fall inside one of the 5 boroughs.
     grid = grid[grid["borough"] != "Other"].copy()
 
+    # DSNY eligibility gate columns (land use + transit). The app chooses whether to use them.
+    if ENABLE_ELIGIBILITY:
+        print("\nApplying DSNY eligibility (land use + transit)...")
+        grid = add_eligibility(grid)
+    else:
+        grid["eligible"] = True
+        grid["near_transit"] = False
+        grid["commercial_area"] = 0.0
+
     # Attach the DOT reality-check column.
     grid["dot_calibration"] = dot_calibration_flag(grid, dot_df).values
 
@@ -599,6 +738,7 @@ if __name__ == "__main__":
     # Save only the columns the app + diagnostics need (this column order is fixed).
     keep_cols = [
         "lat", "lon", "borough", "activity_score", "composite_perperson",
+        "eligible", "near_transit", "commercial_area",
         "score_311", "score_mta", "score_citibike",
         "lodes_pop", "proxy_divergence", "equity_floored", "dot_calibration",
     ]
