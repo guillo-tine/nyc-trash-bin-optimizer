@@ -148,7 +148,8 @@ def build_source_options(proxy, nypd):
         if "composite_perperson" in proxy.columns and has_pop:
             options["Composite (per person)"] = ("proxy", "composite_perperson")
 
-        for label, column in [("311 street complaints", "score_311"),
+        for label, column in [("Basket need (311 requests + overflow)", "score_basket_need"),
+                              ("311 street complaints", "score_311"),
                               ("Subway ridership", "score_mta"),
                               ("Citibike trips", "score_citibike")]:
             # Only offer a column if it actually has data (sum > 0).
@@ -414,16 +415,22 @@ def suggest_new_bins(cand: pd.DataFrame, threshold_index: int,
 # ===========================================================================
 # STEP 4 - Rank suggestions by priority (which to build first)
 # ===========================================================================
-def compute_priority(sugg: pd.DataFrame, dot_df: pd.DataFrame | None = None) -> pd.DataFrame:
+def compute_priority(sugg: pd.DataFrame, dot_df: pd.DataFrame | None = None,
+                     use_commercial: bool = False) -> pd.DataFrame:
     """Give each suggestion a 0-100 Priority score and sort by it.
 
-    Priority blends three ideas:
-        • activity   - how busy the cell is        (the activity index, 0-100)
-        • gap        - how far the nearest bin is   (ranked 0-100 among suggestions)
-        • dot        - is it near a high REAL DOT count?  (a small confidence bonus)
+    Priority blends:
+        • activity    - how busy the cell is          (the activity index, 0-100)
+        • gap         - how far the nearest bin is     (ranked 0-100 among suggestions)
+        • dot         - near a high REAL DOT count?    (a small confidence bonus)
+        • commercial  - how much commercial floor area (DSNY's waste-generation logic)
 
-    With DOT data:    priority = 0.55*activity + 0.35*gap + 0.10*dot
-    Without DOT data: priority = 0.60*activity + 0.40*gap
+    The weights shift depending on which signals are available:
+        activity + gap + dot + commercial:  0.45 / 0.30 / 0.10 / 0.15
+        activity + gap + dot:               0.55 / 0.35 / 0.10
+        activity + gap + commercial:        0.50 / 0.35 / 0.15
+        activity + gap:                     0.60 / 0.40
+    Weights are a deliberate design choice, not a derived optimum.
     """
     if sugg.empty:
         return sugg.assign(priority=pd.Series(dtype=int), dot_verified=pd.Series(dtype=bool))
@@ -432,23 +439,35 @@ def compute_priority(sugg: pd.DataFrame, dot_df: pd.DataFrame | None = None) -> 
     activity = df["activity_index"].astype(float)              # already 0-100
     gap = df["nearest_bin_m"].rank(pct=True) * 100             # 0-100 within the suggestions
 
-    if dot_df is not None and len(dot_df):
+    have_dot = dot_df is not None and len(dot_df)
+    if have_dot:
         # Find the nearest DOT count location to each suggestion.
         dot_xy = to_meters(dot_df["lat"].values, dot_df["lon"].values)
         sugg_xy = to_meters(df["lat"].values, df["lon"].values)
         distance_to_dot, nearest_index = cKDTree(dot_xy).query(sugg_xy, k=1)
-
-        # Rank the DOT counts 0-100; a suggestion gets that score only if a DOT
-        # point is within 500m, otherwise it gets 0 (no nearby ground truth).
+        # Rank the DOT counts 0-100; only counts if a DOT point is within 500m.
         dot_rank = (dot_df["ped_count"].rank(pct=True) * 100).values
         dot_bonus = np.where(distance_to_dot <= 500, dot_rank[nearest_index], 0.0)
-
         df["dot_verified"] = distance_to_dot <= 500
-        df["priority"] = (0.55 * activity + 0.35 * gap + 0.10 * dot_bonus).round().astype(int)
     else:
         df["dot_verified"] = False
-        df["priority"] = (0.60 * activity + 0.40 * gap).round().astype(int)
+        dot_bonus = 0.0
 
+    # Commercial term = how this spot's commercial floor area ranks among the suggestions.
+    # This is DSNY's "businesses generate disposable waste" logic, applied to ordering.
+    have_comm = use_commercial and "commercial_area" in df.columns
+    commercial = (df["commercial_area"].rank(pct=True) * 100) if have_comm else 0.0
+
+    if have_dot and have_comm:
+        score = 0.45 * activity + 0.30 * gap + 0.10 * dot_bonus + 0.15 * commercial
+    elif have_dot:
+        score = 0.55 * activity + 0.35 * gap + 0.10 * dot_bonus
+    elif have_comm:
+        score = 0.50 * activity + 0.35 * gap + 0.15 * commercial
+    else:
+        score = 0.60 * activity + 0.40 * gap
+
+    df["priority"] = score.round().astype(int)
     return df.sort_values("priority", ascending=False).reset_index(drop=True)
 
 
@@ -658,6 +677,16 @@ with st.sidebar:
         ),
     )
 
+    prioritize_commercial = st.checkbox(
+        "Prioritize commercial corners", value=False,
+        help=(
+            "DSNY places baskets where commercial activity generates disposable waste. "
+            "With this on, among equally busy and equally underserved spots, the one with "
+            "more retail/office floor area ranks higher. Adds a commercial term to the "
+            "priority score (weight 0.15). Off by default."
+        ),
+    )
+
     show_eligibility = st.checkbox(
         "Show eligibility signals", value=False,
         help=(
@@ -710,7 +739,8 @@ threshold_index = (10 - sensitivity) * 10
 
 suggested = suggest_new_bins(cand_df, threshold_index, float(min_distance_m), borough,
                              eligible_only=apply_gate)
-suggested = compute_priority(suggested, dot_all if len(dot_all) else None)
+suggested = compute_priority(suggested, dot_all if len(dot_all) else None,
+                             use_commercial=prioritize_commercial)
 
 # What to show on the map for the chosen borough (existing bins + DOT points).
 scope_bins = bins_df if borough == "All Boroughs" else bins_df[bins_df["borough"] == borough]
@@ -790,6 +820,10 @@ with right:
             "live nearby (from Census LODES). This scores activity per person instead of raw "
             "crowd size, so a packed transit hub doesn't automatically outrank a quieter "
             "but underserved neighborhood.",
+        "Basket need (311 requests + overflow)": "Counts of 311 complaints that directly ask "
+            "for basket service: 'Litter Basket Request', 'Litter Basket Complaint', and "
+            "'Overflowing Litter Baskets'. This is the most direct public signal of where "
+            "people actually want or need a basket.",
         "311 street complaints": "Counts of outdoor 311 reports like street and sidewalk "
             "conditions, litter, and noise. These are common in residential areas, where the "
             "NYPD data falls short.",
@@ -807,11 +841,12 @@ with right:
     if len(suggested) > 0:
         st.divider()
         st.caption("**Priority list (build these first)**")
-        st.caption(
-            "The priority score (0 to 100) combines how busy a spot is and how far it is from "
-            "the nearest bin"
-            + (", plus whether a real DOT pedestrian count is nearby." if len(dot_all) else ".")
-        )
+        priority_note = "The priority score (0 to 100) combines how busy a spot is and how far it is from the nearest bin"
+        if prioritize_commercial:
+            priority_note += ", how much commercial activity is there"
+        if len(dot_all):
+            priority_note += ", and whether a real DOT pedestrian count is nearby"
+        st.caption(priority_note + ".")
 
         # Build a friendly, human-readable version of the table.
         ranked = suggested.copy()

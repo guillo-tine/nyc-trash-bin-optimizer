@@ -231,6 +231,43 @@ def fetch_311() -> pd.Series:
 
 
 # ===========================================================================
+# Source 1b - 311 basket-demand (the most direct public waste signal)
+# ===========================================================================
+# Residents reporting that a basket is needed or overflowing. Unlike the general
+# activity proxy, this is people literally asking DSNY for basket service.
+BASKET_311_TYPES = (
+    "'Litter Basket Request','Litter Basket Complaint',"
+    "'Litter Basket / Request','Overflowing Litter Baskets'"
+)
+
+def fetch_basket_need() -> pd.Series:
+    """Score per square = number of 311 basket-demand complaints (requests + overflow)."""
+    cache_path = CACHE_DIR / "311_basket.parquet"
+    try:
+        if cache_path.exists():
+            log("Cache hit: 311_basket")
+            df = pd.read_parquet(cache_path)
+        else:
+            where = f"complaint_type in({BASKET_311_TYPES}) AND latitude IS NOT NULL"
+            log("Downloading 311 basket-demand complaints...")
+            r = requests.get(f"{SOCRATA_CITY}/fhrw-4uyv.csv",
+                             params={"$where": where, "$select": "latitude,longitude",
+                                     "$limit": 100_000, "$order": ":id"}, timeout=180)
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            df.to_parquet(cache_path, index=False)
+            log(f"  311 basket complaints: {len(df):,} cached")
+        df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+        df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+        df = df.dropna(subset=["latitude", "longitude"])
+        cells = to_grid_cells(df["latitude"], df["longitude"])
+        return aggregate_to_grid(cells).rename("score_basket_need")
+    except Exception as e:
+        log(f"WARNING: basket-need fetch failed ({e}). Skipping.")
+        return pd.Series(dtype=float, name="score_basket_need")
+
+
+# ===========================================================================
 # Source 2 - MTA subway ridership
 # ===========================================================================
 def fetch_mta() -> pd.Series:
@@ -620,6 +657,8 @@ def build_grid() -> pd.DataFrame:
     score_mta = fetch_mta()
     print("\n[3/5] Fetching Citibike trip endpoints...")
     score_citibike = fetch_citibike()
+    print("\n[3b] Fetching 311 basket-demand complaints (requests + overflow)...")
+    score_basket = fetch_basket_need()
     print("\n[4/5] Fetching DOT pedestrian counts (calibration)...")
     dot_df = fetch_dot_counts()
 
@@ -636,16 +675,19 @@ def build_grid() -> pd.DataFrame:
 
     print("\nBuilding composite grid...")
 
-    # --- Put every square that ANY source touched onto one shared list ---
+    # --- Put every square that ANY activity source touched onto one shared list ---
+    # (basket-need is attached as a column below, but does NOT expand the cell set, so the
+    # default activity ranking stays identical.)
     all_squares = set(score_311.index) | set(score_mta.index) | set(score_citibike.index)
     index = pd.MultiIndex.from_tuples(sorted(all_squares), names=["grid_x", "grid_y"])
 
     # Line up each source against that shared list (missing squares = 0).
     grid = pd.DataFrame(index=index)
-    grid["score_311"]      = score_311.reindex(index, fill_value=0)
-    grid["score_mta"]      = score_mta.reindex(index, fill_value=0)
-    grid["score_citibike"] = score_citibike.reindex(index, fill_value=0) if not score_citibike.empty else 0.0
-    grid["lodes_pop"]      = lodes.reindex(index, fill_value=0)
+    grid["score_311"]         = score_311.reindex(index, fill_value=0)
+    grid["score_mta"]         = score_mta.reindex(index, fill_value=0)
+    grid["score_citibike"]    = score_citibike.reindex(index, fill_value=0) if not score_citibike.empty else 0.0
+    grid["score_basket_need"] = score_basket.reindex(index, fill_value=0)
+    grid["lodes_pop"]         = lodes.reindex(index, fill_value=0)
 
     # --- Raw composite: the weighted blend of raw scores. This is the app's default
     #     activity score (unchanged from before). MTA weighted highest (real measured
@@ -739,7 +781,7 @@ if __name__ == "__main__":
     keep_cols = [
         "lat", "lon", "borough", "activity_score", "composite_perperson",
         "eligible", "near_transit", "commercial_area",
-        "score_311", "score_mta", "score_citibike",
+        "score_311", "score_mta", "score_citibike", "score_basket_need",
         "lodes_pop", "proxy_divergence", "equity_floored", "dot_calibration",
     ]
     grid[keep_cols].to_csv(OUT_CSV, index=False)
