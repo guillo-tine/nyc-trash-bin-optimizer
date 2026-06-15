@@ -53,6 +53,8 @@ PROXY_GRID_CSV = os.path.join(DATA_DIR, "activity_grid.csv")     # the better co
 BINS_CSV       = os.path.join(DATA_DIR, "litter_baskets.csv")
 DOT_CSV        = os.path.join(DATA_DIR, "dot_counts.csv")        # saved copy of the 114 DOT points
 SUBWAY_CSV     = os.path.join(DATA_DIR, "subway_entrances.csv")  # subway entrances (transit signal)
+INTERSECTIONS_CSV = os.path.join(DATA_DIR, "intersections.csv")  # named street corners (for snapping)
+BUSINESS_CSV      = os.path.join(DATA_DIR, "businesses.csv")     # active food businesses (overlay)
 SOCRATA_BASE   = "https://data.cityofnewyork.us/resource"
 
 GRID_SIZE_M  = 250        # each cell is 250m x 250m
@@ -171,6 +173,25 @@ def load_subway_entrances() -> pd.DataFrame:
         df["borough"] = assign_borough(df["lat"], df["lon"])
         return df
     return pd.DataFrame(columns=["lat", "lon", "borough"])
+
+
+@st.cache_data(show_spinner=False)
+def load_intersections() -> pd.DataFrame:
+    """Named street corners (lat/lon/name) used to snap a 250m cell to a real corner.
+    Bundled offline; returns empty if missing (snapping then falls back to cell centers)."""
+    if os.path.exists(INTERSECTIONS_CSV):
+        return pd.read_csv(INTERSECTIONS_CSV).dropna(subset=["lat", "lon"])
+    return pd.DataFrame(columns=["lat", "lon", "name"])
+
+
+@st.cache_data(show_spinner=False)
+def load_businesses() -> pd.DataFrame:
+    """Active food businesses (lat/lon/name) for the optional 'show businesses' overlay."""
+    if os.path.exists(BUSINESS_CSV):
+        df = pd.read_csv(BUSINESS_CSV).dropna(subset=["lat", "lon"])
+        df["borough"] = assign_borough(df["lat"], df["lon"])
+        return df
+    return pd.DataFrame(columns=["lat", "lon", "name", "borough"])
 
 
 def activity_input(options, choice, proxy, nypd):
@@ -369,8 +390,10 @@ def prepare_candidates(ped_df: pd.DataFrame, bins_df: pd.DataFrame):
         cand["nearest_bin_m"] = np.inf
 
     keep = ["lat", "lon", "borough", "activity_score", "nearest_bin_m"]
-    # Carry DSNY-eligibility columns through if the grid has them (composite sources).
-    for extra in ("eligible", "near_transit", "commercial_area"):
+    # Carry optional grid columns through if the grid has them (composite sources):
+    # eligibility signals, sanitation district / BID tags, businesses, and basket-need.
+    for extra in ("eligible", "near_transit", "commercial_area",
+                  "district", "in_bid", "business_count", "score_basket_need"):
         if extra in cand.columns:
             keep.append(extra)
     return cand[keep].reset_index(drop=True), bins.reset_index(drop=True)
@@ -472,6 +495,236 @@ def compute_priority(sugg: pd.DataFrame, dot_df: pd.DataFrame | None = None,
 
 
 # ===========================================================================
+# STEP 4b - Make the output usable for DSNY (corners, baskets, risk, relocation)
+# ===========================================================================
+def snap_to_corners(sugg: pd.DataFrame, inter_df: pd.DataFrame,
+                    max_m: float = 180.0) -> pd.DataFrame:
+    """Snap each suggestion to the nearest real street corner within max_m.
+
+    DSNY places baskets on a named corner, not in a 250m square. Adds corner_lat,
+    corner_lon, corner_name. If no corner is close enough, it keeps the cell center.
+    """
+    out = sugg.copy()
+    if out.empty:
+        out["corner_lat"] = []; out["corner_lon"] = []; out["corner_name"] = []
+        return out
+    corner_lat = out["lat"].to_numpy(dtype=float).copy()
+    corner_lon = out["lon"].to_numpy(dtype=float).copy()
+    corner_name = np.array([""] * len(out), dtype=object)
+    if inter_df is not None and not inter_df.empty:
+        inter_xy = to_meters(inter_df["lat"].values, inter_df["lon"].values)
+        sugg_xy = to_meters(out["lat"].values, out["lon"].values)
+        dist, idx = cKDTree(inter_xy).query(sugg_xy, k=1)
+        hit = dist <= max_m
+        lat_a = inter_df["lat"].values; lon_a = inter_df["lon"].values
+        name_a = inter_df["name"].astype(str).values
+        corner_lat[hit] = lat_a[idx[hit]]
+        corner_lon[hit] = lon_a[idx[hit]]
+        corner_name[hit] = name_a[idx[hit]]
+    out["corner_lat"] = corner_lat
+    out["corner_lon"] = corner_lon
+    out["corner_name"] = corner_name
+    return out
+
+
+def enrich_suggestions(df: pd.DataFrame) -> pd.DataFrame:
+    """Add the planner-facing fields: how many baskets, and household-misuse risk.
+
+    • recommended_baskets - busier corners (and high basket-need) warrant more than one.
+    • misuse_risk - residential / non-eligible / no commercial floor area. These are the
+      blocks where baskets get filled with household trash and DSNY ends up removing them.
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    ai = df["activity_index"].to_numpy(dtype=float)
+    rec = np.ones(len(df), dtype=int)
+    rec[ai >= 60] = 2
+    rec[ai >= 80] = 3
+    df["recommended_baskets"] = rec
+
+    elig = df["eligible"].astype(bool).to_numpy() if "eligible" in df.columns else np.ones(len(df), bool)
+    comm = df["commercial_area"].to_numpy(dtype=float) if "commercial_area" in df.columns else np.ones(len(df))
+    df["misuse_risk"] = (~elig) | (comm <= 0)
+    return df
+
+
+def removable_bins(bins_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame:
+    """Existing bins that are good candidates to MOVE (so a new corner costs nothing).
+
+    A bin is 'removable' when its cell is NOT DSNY-eligible (residential / parks /
+    industrial) AND it is either redundant (another bin within 150m) or in a very
+    low-activity cell. This is conservative on purpose.
+    """
+    if bins_df.empty or "eligible" not in cand_df.columns:
+        return bins_df.iloc[0:0]
+    cell_xy = to_meters(cand_df["lat"].values, cand_df["lon"].values)
+    bin_xy = to_meters(bins_df["lat"].values, bins_df["lon"].values)
+    _, ci = cKDTree(cell_xy).query(bin_xy, k=1)
+    elig = cand_df["eligible"].astype(bool).to_numpy()[ci]
+    act = cand_df["activity_score"].to_numpy(dtype=float)[ci]
+    act_rank = pd.Series(act).rank(pct=True).to_numpy() * 100
+    nn = cKDTree(bin_xy).query(bin_xy, k=2)[0][:, 1]   # distance to the nearest OTHER bin
+    b = bins_df.copy()
+    b["near_other_bin_m"] = nn
+    removable = (~elig) & ((nn <= 150) | (act_rank <= 25))
+    return b[removable].reset_index(drop=True)
+
+
+def pair_relocations(suggested: pd.DataFrame, removable: pd.DataFrame, n: int = 50) -> pd.DataFrame:
+    """Pair each of the top-N suggested corners with the nearest removable bin:
+    a concrete 'move this bin to here, net cost zero' list."""
+    if suggested.empty or removable.empty:
+        return pd.DataFrame()
+    top = suggested.head(n)
+    rem_xy = to_meters(removable["lat"].values, removable["lon"].values)
+    tgt_xy = to_meters(top["corner_lat"].values, top["corner_lon"].values)
+    d, idx = cKDTree(rem_xy).query(tgt_xy, k=1)
+    return pd.DataFrame({
+        "Priority":          top["priority"].to_numpy(),
+        "Move to":           top["corner_name"].to_numpy(),
+        "To lat":            np.round(top["corner_lat"].to_numpy(), 5),
+        "To lon":            np.round(top["corner_lon"].to_numpy(), 5),
+        "From lat":          np.round(removable["lat"].to_numpy()[idx], 5),
+        "From lon":          np.round(removable["lon"].to_numpy()[idx], 5),
+        "Move distance (m)": np.round(d, 0).astype(int),
+    })
+
+
+@st.cache_data(show_spinner=False)
+def calibrated_min_gap(proxy, bins_raw, fallback: int = 300) -> int:
+    """Derive the default minimum bin spacing from the REAL median spacing between
+    existing DSNY baskets that sit in commercial cells - instead of an invented number.
+    Returns a value rounded to the nearest 25m, clamped to the slider's range.
+    """
+    try:
+        if proxy is None or "commercial_area" not in proxy.columns:
+            return fallback
+        b, la, lo = pick_lat_lon_columns(bins_raw)
+        bins = clean_latlon(b, la, lo)
+        comm = proxy[pd.to_numeric(proxy["commercial_area"], errors="coerce").fillna(0) > 0]
+        if bins.empty or comm.empty:
+            return fallback
+        comm_xy = to_meters(comm["lat"].values, comm["lon"].values)
+        bin_xy = to_meters(bins["lat"].values, bins["lon"].values)
+        dist_to_comm, _ = cKDTree(comm_xy).query(bin_xy, k=1)
+        in_comm = bin_xy[dist_to_comm <= 180]          # baskets in/next to a commercial cell
+        if len(in_comm) < 50:
+            return fallback
+        nn = cKDTree(in_comm).query(in_comm, k=2)[0][:, 1]
+        med = float(np.median(nn))
+        return int(min(800, max(25, round(med / 25) * 25)))
+    except Exception:
+        return fallback
+
+
+def defend_html(row) -> str:
+    """The 'why this corner' panel: a few plain-English facts a planner can paste
+    into a memo. Works on a namedtuple row (uses getattr with safe defaults)."""
+    pr = int(getattr(row, "priority", 50))
+    ai = int(getattr(row, "activity_index", 0))
+    gap_m = float(getattr(row, "nearest_bin_m", 0))
+    corner = str(getattr(row, "corner_name", "") or "")
+    head = f"<b>Suggested new bin</b>"
+    if corner:
+        head += f"<br/><b>{corner}</b>"
+    parts = [
+        head,
+        f"Priority: <b>{pr}</b>/100",
+        f"Busier than <b>{ai}%</b> of corners in view",
+        f"Nearest existing bin: <b>{gap_m:.0f} m</b> ({gap_m * 3.281:.0f} ft) away",
+    ]
+    bc = getattr(row, "business_count", None)
+    if bc is not None and not pd.isna(bc):
+        parts.append(f"Businesses on this block: <b>{int(bc)}</b>")
+    bn = getattr(row, "score_basket_need", None)
+    if bn is not None and not pd.isna(bn) and float(bn) > 0:
+        parts.append(f"311 basket-service requests here: <b>{int(float(bn))}</b>")
+    rb = getattr(row, "recommended_baskets", None)
+    if rb is not None and not pd.isna(rb):
+        parts.append(f"Recommended baskets: <b>{int(rb)}</b>")
+    elig = getattr(row, "eligible", None)
+    if elig is not None:
+        risk = bool(getattr(row, "misuse_risk", False))
+        parts.append("<hr style='margin:4px 0'>"
+                     f"DSNY-eligible: <b>{'Yes' if bool(elig) else 'No'}</b>")
+        parts.append(f"Household-misuse risk: <b>{'High' if risk else 'Low'}</b>")
+    dist = str(getattr(row, "district", "") or "")
+    if dist:
+        in_bid = bool(getattr(row, "in_bid", False))
+        parts.append(f"Sanitation district: <b>{dist}</b>"
+                     + (" &middot; <b>inside a BID</b>" if in_bid else ""))
+    return "<br/>".join(parts)
+
+
+def build_report_html(table: pd.DataFrame, district: str, borough: str,
+                      source: str, gap_m: float) -> str:
+    """A printable one-page shortlist (HTML). A planner opens it and uses the browser's
+    Print -> Save as PDF, so we add zero PDF dependencies."""
+    scope = district if district != "All districts" else borough
+    head = "".join(f"<th>{c}</th>" for c in table.columns)
+    rows = "\n".join(
+        "<tr>" + "".join(f"<td>{v}</td>" for v in rec) + "</tr>"
+        for rec in table.itertuples(index=False)
+    )
+    return f"""<!doctype html><html><head><meta charset='utf-8'>
+<title>DSNY Litter Basket Shortlist - {scope}</title>
+<style>
+ body{{font-family:Arial,Helvetica,sans-serif;margin:32px;color:#111}}
+ h1{{font-size:18px;margin:0 0 4px}} .sub{{color:#555;font-size:12px;margin-bottom:16px}}
+ table{{border-collapse:collapse;width:100%;font-size:12px}}
+ th,td{{border:1px solid #ccc;padding:4px 6px;text-align:left}} th{{background:#f2f2f2}}
+</style></head><body>
+<h1>NYC Litter Basket Shortlist - {scope}</h1>
+<div class='sub'>Activity source: {source}. Minimum gap from an existing bin: {int(gap_m)} m.
+Ranked by priority (busyness + coverage gap + commercial activity). {len(table)} corners.</div>
+<table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table>
+<p style='margin-top:16px;color:#777;font-size:11px'>Generated by the NYC Trash Bin Optimizer.
+Suggestions are candidates for a planner to confirm.</p>
+</body></html>"""
+
+
+@st.cache_data(show_spinner=False)
+def compute_validation(proxy, bins_raw, dot_df) -> dict:
+    """Two honest, explainable checks of the placement logic:
+
+      • recovery - of the city's existing DSNY baskets, what share sit in cells the model
+                   would INDEPENDENTLY call basket-worthy (busy AND DSNY-eligible)? High =
+                   the logic agrees with where DSNY already chose to put baskets.
+      • dot_corr - how well does our activity rank track the 114 REAL DOT pedestrian
+                   counts (Spearman correlation)?
+
+    Returns a dict; values are None when a check can't be run.
+    """
+    res = {"recovery": None, "n_bins": 0, "dot_corr": None, "n_dot": 0}
+    try:
+        if proxy is None or "eligible" not in proxy.columns:
+            return res
+        cells = proxy.dropna(subset=["lat", "lon", "activity_score"]).copy()
+        cells["ai"] = cells["activity_score"].rank(pct=True) * 100
+        tree = cKDTree(to_meters(cells["lat"].values, cells["lon"].values))
+
+        b, la, lo = pick_lat_lon_columns(bins_raw)
+        bins = clean_latlon(b, la, lo)
+        if not bins.empty:
+            _, bi = tree.query(to_meters(bins["lat"].values, bins["lon"].values), k=1)
+            elig = cells["eligible"].astype(bool).to_numpy()[bi]
+            busy = cells["ai"].to_numpy()[bi] >= 50
+            res["recovery"] = float((elig & busy).mean())
+            res["n_bins"] = int(len(bins))
+
+        if dot_df is not None and len(dot_df):
+            _, di = tree.query(to_meters(dot_df["lat"].values, dot_df["lon"].values), k=1)
+            from scipy.stats import spearmanr
+            r, _ = spearmanr(cells["ai"].to_numpy()[di], dot_df["ped_count"].to_numpy())
+            res["dot_corr"] = float(r) if r == r else None   # r==r filters out NaN
+            res["n_dot"] = int(len(dot_df))
+    except Exception:
+        pass
+    return res
+
+
+# ===========================================================================
 # Drawing the map
 # ===========================================================================
 def thin_points(df: pd.DataFrame, cap: int) -> pd.DataFrame:
@@ -493,7 +746,9 @@ def thin_points(df: pd.DataFrame, cap: int) -> pd.DataFrame:
 def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
              dot_df: pd.DataFrame | None = None,
              cells_df: pd.DataFrame | None = None, show_all: bool = False,
-             show_eligibility: bool = False, entrances_df: pd.DataFrame | None = None) -> folium.Map:
+             show_eligibility: bool = False, entrances_df: pd.DataFrame | None = None,
+             businesses_df: pd.DataFrame | None = None,
+             relocations_df: pd.DataFrame | None = None) -> folium.Map:
     """Build the Folium map: blue DOT circles (optional), red bins, green suggestions.
 
     When show_all is True ("Visualize everything"):
@@ -534,6 +789,27 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
                 popup="Subway entrance (a 'near transit' signal for eligibility)",
             ).add_to(fmap)
 
+    # Businesses overlay: a literal "where the businesses are" layer (orange dots),
+    # so a planner can see what drives a commercial score. Thinned for speed.
+    if businesses_df is not None and len(businesses_df):
+        for biz in thin_points(businesses_df, 1500).itertuples():
+            folium.CircleMarker(
+                [biz.lat, biz.lon], radius=2, color="#e8820c", weight=0,
+                fill=True, fill_opacity=0.5,
+                popup=folium.Popup(f"<b>{getattr(biz, 'name', 'Business')}</b>", max_width=200),
+            ).add_to(fmap)
+
+    # Relocation lines: "move this bin to this corner" (net-zero). Orange line from the
+    # removable bin to the target corner, with a hollow marker at the bin being moved.
+    if relocations_df is not None and len(relocations_df):
+        for r in relocations_df.itertuples():
+            folium.PolyLine([[r._5, r._6], [r._3, r._4]],   # From (lat,lon) -> To (lat,lon)
+                            color="#e8820c", weight=2, opacity=0.7).add_to(fmap)
+            folium.CircleMarker(
+                [r._5, r._6], radius=5, color="#e8820c", weight=2, fill=True, fill_opacity=0.15,
+                popup=folium.Popup(f"<b>Move this bin</b><br/>to {r._2}", max_width=220),
+            ).add_to(fmap)
+
     # In "everything" mode we lift the drawing caps so nothing is hidden.
     bin_cap  = 12000 if show_all else MAP_BIN_CAP
     sugg_cap = len(suggested_df) if show_all else MAP_SUGG_CAP
@@ -558,35 +834,24 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
             [b.lat, b.lon], radius=2, color="#cc2200", weight=0, fill=True, fill_opacity=0.5,
         ).add_to(fmap)
 
-    # Green dots: the suggestions. Higher priority = bigger and brighter.
+    # Green dots: the suggestions, drawn at their snapped street corner when available.
+    # Higher priority = bigger and brighter. The popup is the "defend this pick" panel.
     for s in suggested_df.head(sugg_cap).itertuples():
-        feet = s.nearest_bin_m * 3.281
+        plat = float(getattr(s, "corner_lat", s.lat))
+        plon = float(getattr(s, "corner_lon", s.lon))
         priority = int(getattr(s, "priority", 50))
         radius = 4 + 5 * (priority / 100)
         opacity = 0.45 + 0.45 * (priority / 100)
-
-        popup_html = (
-            f"<b>Suggested new bin</b><br/>"
-            f"Priority: <b>{priority}</b>/100<br/>"
-            f"Activity index: <b>{s.activity_index}</b>/100<br/>"
-            f"Nearest existing bin: <b>{s.nearest_bin_m:.0f} m</b> ({feet:.0f} ft)"
-        )
-        # If the grid carries DSNY signals, show WHY this spot qualifies.
-        eligible = getattr(s, "eligible", None)
-        if eligible is not None:
-            near = bool(getattr(s, "near_transit", False))
-            comm = float(getattr(s, "commercial_area", 0) or 0)
-            popup_html += (
-                "<hr style='margin:4px 0'>"
-                f"<b>Why it's DSNY-eligible</b><br/>"
-                f"Commercial / mixed-use here: <b>{'Yes' if comm > 0 else 'No'}</b><br/>"
-                f"Near a subway entrance: <b>{'Yes' if near else 'No'}</b><br/>"
-                f"Commercial floor area: <b>{comm:,.0f} sq ft</b>"
-            )
-
+        # Mark high household-misuse-risk picks with a hollow ring instead of a solid dot.
+        risk = bool(getattr(s, "misuse_risk", False))
+        corner = str(getattr(s, "corner_name", "") or "")
+        tip = (corner + " - " if corner else "") + f"Priority {priority}/100"
         folium.CircleMarker(
-            [s.lat, s.lon], radius=radius, color="#00aa44", weight=0, fill=True, fill_opacity=opacity,
-            popup=folium.Popup(popup_html, max_width=300), tooltip=f"Priority {priority}/100",
+            [plat, plon], radius=radius,
+            color="#b06a00" if risk else "#00aa44",
+            weight=2 if risk else 0, fill=True,
+            fill_opacity=0.12 if risk else opacity,
+            popup=folium.Popup(defend_html(s), max_width=300), tooltip=tip,
         ).add_to(fmap)
 
     return fmap
@@ -607,6 +872,12 @@ st.caption(
 with st.spinner("Loading NYC data…"):
     proxy_df, nypd_df, bins_raw = load_sources()
 source_options = build_source_options(proxy_df, nypd_df)
+
+# Default minimum spacing, derived from the REAL spacing of existing commercial-area
+# baskets (not an invented number). And the list of DSNY sanitation districts present.
+default_gap = calibrated_min_gap(proxy_df, bins_raw)
+district_list = (sorted(d for d in proxy_df["district"].dropna().unique() if d)
+                 if proxy_df is not None and "district" in proxy_df.columns else [])
 
 # Figure out which layers are actually inside the composite grid, so the
 # description we show the user is always honest (e.g. Citibike only appears
@@ -658,12 +929,17 @@ with st.sidebar:
     )
 
     min_distance_m = st.slider(
-        "Minimum gap from existing bin (meters)", min_value=25, max_value=800, value=300, step=25,
+        "Minimum gap from existing bin (meters)", min_value=25, max_value=800,
+        value=default_gap, step=25,
         help=(
             "A spot is only suggested if there's no bin within this distance.\n\n"
-            "**300 m is about one city block.** Raise it to find only the most isolated gaps."
+            f"The default (**{default_gap} m**) is the *measured* median spacing between "
+            "existing DSNY baskets in commercial areas, so it matches how the city already "
+            "spaces them. Raise it to find only the most isolated gaps."
         ),
     )
+    st.caption(f"Default gap {default_gap} m = measured median spacing of existing "
+               "commercial-area baskets.")
 
     apply_gate = st.checkbox(
         "Apply DSNY eligibility rules", value=False,
@@ -686,6 +962,55 @@ with st.sidebar:
             "priority score (weight 0.15). Off by default."
         ),
     )
+
+    st.divider()
+
+    district_choice = st.selectbox(
+        "Sanitation district", ["All districts"] + district_list,
+        help=(
+            "Narrow the shortlist to one DSNY sanitation district (e.g. BKN03). DSNY plans "
+            "district by district, so this gives a superintendent just their corners. The "
+            "export and printable report then cover only this district."
+        ),
+    ) if district_list else "All districts"
+
+    budget = st.number_input(
+        "Budget: number of new baskets (0 = no limit)", min_value=0, max_value=2000,
+        value=0, step=5,
+        help=(
+            "If you can fund a fixed number of baskets, set it here and the tool returns "
+            "exactly that many - the highest-priority corners first. 0 shows the full list."
+        ),
+    )
+
+    snap_corners = st.checkbox(
+        "Snap suggestions to nearest street corner", value=True,
+        help=(
+            "DSNY places a basket on a named corner, not in the middle of a 250 m square. "
+            "With this on, each suggestion is moved to the nearest real street intersection "
+            "(within 180 m) and labeled, e.g. 'Broadway & W 145 St'. On by default."
+        ),
+    )
+
+    relocation_mode = st.checkbox(
+        "Relocation mode (net-zero: move low-value bins)", value=False,
+        help=(
+            "DSNY rarely funds new baskets, but it can MOVE one. With this on, the tool finds "
+            "existing baskets on low-value blocks (residential / redundant) and pairs each top "
+            "corner with the nearest one to move, so a new corner costs nothing. Draws orange "
+            "'move from -> to' lines and a relocation table. Off by default."
+        ),
+    )
+
+    show_business = st.checkbox(
+        "Show nearby businesses", value=False,
+        help=(
+            "Overlays active food businesses (NYC DOHMH) as orange dots, so you can literally "
+            "see the businesses behind a commercial score. Off by default."
+        ),
+    )
+
+    st.divider()
 
     show_eligibility = st.checkbox(
         "Show eligibility signals", value=False,
@@ -730,6 +1055,8 @@ except ValueError as e:
 
 dot_all = load_dot_counts()
 entrances_all = load_subway_entrances()
+intersections_all = load_intersections()
+businesses_all = load_businesses()
 
 # Sensitivity 1-10 becomes a 0-100 cutoff:
 #   sensitivity 1  -> cutoff 90 (only the top 10% busiest cells)
@@ -742,6 +1069,24 @@ suggested = suggest_new_bins(cand_df, threshold_index, float(min_distance_m), bo
 suggested = compute_priority(suggested, dot_all if len(dot_all) else None,
                              use_commercial=prioritize_commercial)
 
+# Make the output usable: snap to a real corner, add basket count + misuse risk.
+suggested = snap_to_corners(suggested, intersections_all if snap_corners else None)
+suggested = enrich_suggestions(suggested)
+
+# Narrow to one sanitation district if the planner picked one.
+if district_choice != "All districts" and "district" in suggested.columns:
+    suggested = suggested[suggested["district"] == district_choice].reset_index(drop=True)
+
+# Budget cap: keep only the top-N highest-priority corners.
+if budget and budget > 0:
+    suggested = suggested.head(int(budget)).reset_index(drop=True)
+
+# Relocation pairing (net-zero): only computed when the planner asks for it.
+relocations = pd.DataFrame()
+if relocation_mode:
+    scope_for_reloc = cand_df if borough == "All Boroughs" else cand_df[cand_df["borough"] == borough]
+    relocations = pair_relocations(suggested, removable_bins(bins_df, scope_for_reloc), n=50)
+
 # What to show on the map for the chosen borough (existing bins + DOT points).
 scope_bins = bins_df if borough == "All Boroughs" else bins_df[bins_df["borough"] == borough]
 if scope_bins.empty:
@@ -749,6 +1094,7 @@ if scope_bins.empty:
 scope_cells = cand_df if borough == "All Boroughs" else cand_df[cand_df["borough"] == borough]
 dot_scope = dot_all if borough == "All Boroughs" else dot_all[dot_all["borough"] == borough]
 ent_scope = entrances_all if borough == "All Boroughs" else entrances_all[entrances_all["borough"] == borough]
+biz_scope = businesses_all if borough == "All Boroughs" else businesses_all[businesses_all["borough"] == borough]
 
 # ---- Layout: map on the left, summary on the right ----
 left, right = st.columns([2, 1], gap="large")
@@ -762,6 +1108,12 @@ with left:
         legend += " The heat shows activity level."
     if show_eligibility:
         legend += " Green heat shows commercial floor area (businesses); purple dots are subway entrances."
+    if show_business:
+        legend += " Orange dots are nearby businesses."
+    if relocation_mode:
+        legend += " Orange lines show a bin to move and the corner to move it to."
+    if snap_corners:
+        legend += " Suggestions sit on the nearest real street corner."
     st.caption(legend + " Click any dot for details.")
     if apply_gate:
         if "eligible" in cand_df.columns:
@@ -782,7 +1134,9 @@ with left:
         make_map(scope_bins, suggested, borough, dot_scope if show_dot else None,
                  cells_df=scope_cells, show_all=show_all,
                  show_eligibility=show_eligibility,
-                 entrances_df=ent_scope if show_eligibility else None),
+                 entrances_df=ent_scope if show_eligibility else None,
+                 businesses_df=biz_scope if show_business else None,
+                 relocations_df=relocations if relocation_mode else None),
         width=900, height=650, returned_objects=[],
     )
 
@@ -797,6 +1151,22 @@ with right:
             "No recommendations with these settings. Try raising **Sensitivity** "
             "or lowering the **minimum gap**."
         )
+
+    val = compute_validation(proxy_df, bins_raw, dot_all)
+    if val["recovery"] is not None or val["dot_corr"] is not None:
+        with st.expander("How well does this match reality?"):
+            if val["recovery"] is not None:
+                st.caption(
+                    f"**Recovery: {val['recovery'] * 100:.0f}%** of the city's "
+                    f"{val['n_bins']:,} existing baskets sit in cells the model independently "
+                    "flags as basket-worthy (busy and DSNY-eligible). Higher means the logic "
+                    "agrees with where DSNY already places baskets.")
+            if val["dot_corr"] is not None:
+                st.caption(
+                    f"**DOT agreement: Spearman r = {val['dot_corr']:.2f}** between our activity "
+                    f"rank and the {val['n_dot']} real DOT pedestrian counts (1.0 = perfect, "
+                    "0 = none).")
+            st.caption("These are transparent sanity checks, not a trained model's accuracy.")
 
     st.divider()
     st.caption("**How it works**")
@@ -852,22 +1222,60 @@ with right:
         ranked = suggested.copy()
         ranked.insert(0, "Rank", range(1, len(ranked) + 1))
         ranked["Priority"]       = ranked["priority"]
+        if "corner_name" in ranked.columns:
+            ranked["Corner"]     = ranked["corner_name"].replace("", "(cell center)")
         ranked["Borough"]        = ranked["borough"]
+        if "district" in ranked.columns:
+            ranked["District"]   = ranked["district"]
         ranked["Activity index"] = ranked["activity_index"]
         ranked["Gap to bin (m)"] = ranked["nearest_bin_m"].round(0).astype(int)
-        ranked["Latitude"]       = ranked["lat"].round(5)
-        ranked["Longitude"]      = ranked["lon"].round(5)
+        if "recommended_baskets" in ranked.columns:
+            ranked["Baskets"]    = ranked["recommended_baskets"]
+        if "misuse_risk" in ranked.columns:
+            ranked["Misuse risk"] = np.where(ranked["misuse_risk"], "high", "low")
+        # Export the snapped corner coordinate when we have it, else the cell center.
+        lat_src = ranked["corner_lat"] if "corner_lat" in ranked.columns else ranked["lat"]
+        lon_src = ranked["corner_lon"] if "corner_lon" in ranked.columns else ranked["lon"]
+        ranked["Latitude"]       = lat_src.round(5)
+        ranked["Longitude"]      = lon_src.round(5)
         if "dot_verified" in ranked.columns and ranked["dot_verified"].any():
             ranked["DOT-verified"] = np.where(ranked["dot_verified"], "yes", "")
 
-        show_cols = ["Rank", "Priority", "Borough", "Activity index", "Gap to bin (m)", "Latitude", "Longitude"]
+        show_cols = ["Rank", "Priority"]
+        if "Corner" in ranked.columns:      show_cols.append("Corner")
+        show_cols.append("Borough")
+        if "District" in ranked.columns:    show_cols.append("District")
+        show_cols += ["Activity index", "Gap to bin (m)"]
+        if "Baskets" in ranked.columns:     show_cols.append("Baskets")
+        if "Misuse risk" in ranked.columns: show_cols.append("Misuse risk")
+        show_cols += ["Latitude", "Longitude"]
         if "DOT-verified" in ranked.columns:
             show_cols.insert(2, "DOT-verified")
 
         st.dataframe(ranked[show_cols].head(20), use_container_width=True, hide_index=True)
+
+        scope_tag = (district_choice if district_choice != "All districts"
+                     else borough).replace(" ", "_").lower()
         st.download_button(
-            "Download full priority list (CSV)",
+            "Download priority list (CSV)",
             ranked[show_cols].to_csv(index=False).encode("utf-8"),
-            file_name=f"bin_priority_{borough.replace(' ', '_').lower()}.csv",
-            mime="text/csv",
+            file_name=f"bin_priority_{scope_tag}.csv", mime="text/csv",
         )
+        st.download_button(
+            "Download printable report (HTML)",
+            build_report_html(ranked[show_cols], district_choice, borough,
+                              source_choice, min_distance_m).encode("utf-8"),
+            file_name=f"bin_report_{scope_tag}.html", mime="text/html",
+        )
+
+        if relocation_mode and len(relocations):
+            st.divider()
+            st.caption(f"**Relocation plan (net-zero): {len(relocations)} bins to move**")
+            st.caption("Each top corner is paired with the nearest low-value existing bin to "
+                       "move there, so adding the corner costs nothing.")
+            st.dataframe(relocations.head(20), use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download relocation plan (CSV)",
+                relocations.to_csv(index=False).encode("utf-8"),
+                file_name=f"bin_relocations_{scope_tag}.csv", mime="text/csv",
+            )

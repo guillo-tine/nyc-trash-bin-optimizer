@@ -616,6 +616,182 @@ def add_eligibility(grid: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===========================================================================
+# Source 7 - Usability layers: street corners, businesses, districts, BIDs
+# ===========================================================================
+# These do NOT change the activity score. They make the output something a DSNY
+# planner can act on: a named corner, the businesses behind a score, the sanitation
+# district a pick belongs to, and whether it sits in a self-serviced BID.
+CENTERLINE_DATASET = "inkn-q76z"   # CSCL street centerline (to name real corners)
+DOHMH_DATASET      = "43nn-pn8j"   # restaurant inspections (a literal "businesses" layer)
+DSNY_DISTRICTS     = "i6mn-amj2"   # DSNY sanitation districts (e.g. BKS13) - polygons
+BID_DATASET        = "7jdm-inj8"   # Business Improvement Districts - polygons
+
+
+def fetch_intersections() -> pd.DataFrame:
+    """Real named street corners, derived from the CSCL street centerline.
+
+    DSNY places a basket ON a corner, not in a 250m square. We download the street
+    centerline, collect the endpoints of every segment, and call a point an
+    'intersection' when 2+ differently-named streets share it. The name becomes
+    'Street A & Street B'. Returns lat/lon/name. Cached. Graceful-empty on failure.
+    """
+    cache = CACHE_DIR / "intersections.parquet"
+    if cache.exists():
+        log("Cache hit: intersections")
+        return pd.read_parquet(cache)
+    try:
+        ep_cache = CACHE_DIR / "centerline_endpoints.parquet"
+        if ep_cache.exists():
+            log("Cache hit: centerline_endpoints")
+            ep = pd.read_parquet(ep_cache)
+        else:
+            rows, page = [], 50_000
+            for offset in range(0, 250_000, page):
+                log(f"  Downloading street centerline (offset {offset:,})...")
+                r = requests.get(f"{SOCRATA_CITY}/{CENTERLINE_DATASET}.json",
+                                 params={"$select": "the_geom,full_street_name",
+                                         "$limit": page, "$offset": offset, "$order": ":id"},
+                                 headers=socrata_headers(), timeout=300)
+                r.raise_for_status()
+                batch = r.json()
+                if not batch:
+                    break
+                for seg in batch:
+                    name = (seg.get("full_street_name") or "").strip()
+                    geom = seg.get("the_geom")
+                    if not name or not geom:
+                        continue
+                    # MultiLineString coordinates = list of lines; each line a list of [lon,lat].
+                    for line in geom.get("coordinates", []):
+                        if not line:
+                            continue
+                        for lon, lat in (line[0], line[-1]):   # both ends of the line
+                            rows.append((round(float(lat), 5), round(float(lon), 5), name))
+                if len(batch) < page:
+                    break
+            ep = pd.DataFrame(rows, columns=["lat", "lon", "street"])
+            ep.to_parquet(ep_cache, index=False)
+        # A corner = a point where 2+ distinct street names meet.
+        grp = ep.groupby(["lat", "lon"])["street"].agg(lambda s: sorted(set(s)))
+        grp = grp[grp.map(len) >= 2]
+        out = pd.DataFrame({
+            "lat":  grp.index.get_level_values("lat"),
+            "lon":  grp.index.get_level_values("lon"),
+            "name": grp.map(lambda names: " & ".join(names[:2])).values,
+        })
+        out.to_parquet(cache, index=False)
+        log(f"  Intersections: {len(out):,} named corners")
+        return out
+    except Exception as e:
+        log(f"WARNING: intersections build failed ({e}). Corner snapping will fall back to cell centers.")
+        return pd.DataFrame(columns=["lat", "lon", "name"])
+
+
+def fetch_businesses() -> pd.DataFrame:
+    """Active food businesses (DOHMH), deduped by CAMIS - a literal 'where the
+    businesses are' layer so a planner can see what drives a commercial score.
+    Returns lat/lon/name within NYC bounds. Cached. Graceful-empty on failure.
+    """
+    cache = CACHE_DIR / "businesses.parquet"
+    if cache.exists():
+        log("Cache hit: businesses")
+        return pd.read_parquet(cache)
+    try:
+        frames, page = [], 50_000
+        for offset in range(0, 300_000, page):
+            log(f"  Downloading businesses (offset {offset:,})...")
+            r = requests.get(f"{SOCRATA_CITY}/{DOHMH_DATASET}.csv",
+                             params={"$select": "camis,dba,latitude,longitude",
+                                     "$where": "latitude IS NOT NULL AND latitude != '0'",
+                                     "$limit": page, "$offset": offset, "$order": ":id"},
+                             headers=socrata_headers(), timeout=180)
+            r.raise_for_status()
+            chunk = pd.read_csv(io.StringIO(r.text))
+            if chunk.empty:
+                break
+            frames.append(chunk)
+            if len(chunk) < page:
+                break
+        df = pd.concat(frames, ignore_index=True).drop_duplicates("camis")
+        df = df.rename(columns={"latitude": "lat", "longitude": "lon", "dba": "name"})
+        for c in ["lat", "lon"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["lat", "lon"])
+        df = df[df["lat"].between(40.4, 41.0) & df["lon"].between(-74.3, -73.6)]
+        out = df[["lat", "lon", "name"]].reset_index(drop=True)
+        out.to_parquet(cache, index=False)
+        log(f"  Businesses: {len(out):,} active food businesses")
+        return out
+    except Exception as e:
+        log(f"WARNING: businesses fetch failed ({e}). Skipping business layer.")
+        return pd.DataFrame(columns=["lat", "lon", "name"])
+
+
+def _load_polygons(dataset, geom_field, name_field, label) -> "gpd.GeoDataFrame":
+    """Fetch a small polygon dataset as a GeoDataFrame [label, geometry]."""
+    from shapely.geometry import shape
+    r = requests.get(f"{SOCRATA_CITY}/{dataset}.json",
+                     params={"$limit": 5000}, headers=socrata_headers(), timeout=120)
+    r.raise_for_status()
+    geoms, names = [], []
+    for rec in r.json():
+        g = rec.get(geom_field)
+        if not g:
+            continue
+        try:
+            geoms.append(shape(g))
+        except Exception:
+            continue
+        names.append(rec.get(name_field))
+    return gpd.GeoDataFrame({label: names}, geometry=geoms, crs="EPSG:4326")
+
+
+def add_districts_and_bids(grid: pd.DataFrame) -> pd.DataFrame:
+    """Tag each cell with its DSNY sanitation district and whether it sits in a BID.
+
+    (BIDs service their own litter, so a city basket inside one is usually redundant.)
+    """
+    grid["district"] = ""
+    grid["in_bid"] = False
+    try:
+        pts = gpd.GeoDataFrame(geometry=gpd.points_from_xy(grid["lon"], grid["lat"]),
+                               crs="EPSG:4326")
+        pts.index = grid.index
+        try:
+            dist = _load_polygons(DSNY_DISTRICTS, "multipolygon", "district", "district")
+            j = gpd.sjoin(pts, dist, predicate="within", how="left")
+            j = j[~j.index.duplicated(keep="first")]
+            grid["district"] = j["district"].reindex(grid.index).fillna("").values
+        except Exception as e:
+            log(f"  WARNING: DSNY districts failed ({e}).")
+        try:
+            bid = _load_polygons(BID_DATASET, "the_geom", "f_all_bids", "bid")
+            jb = gpd.sjoin(pts, bid, predicate="within", how="left")
+            jb = jb[~jb.index.duplicated(keep="first")]
+            grid["in_bid"] = jb["bid"].reindex(grid.index).notna().values
+        except Exception as e:
+            log(f"  WARNING: BIDs failed ({e}).")
+    except Exception as e:
+        log(f"WARNING: district/BID tagging failed ({e}).")
+    log(f"  Districts tagged: {int((grid['district'] != '').sum()):,}/{len(grid):,}; "
+        f"in a BID: {int(grid['in_bid'].sum()):,}")
+    return grid
+
+
+def add_business_count(grid: pd.DataFrame, businesses: pd.DataFrame) -> pd.DataFrame:
+    """Count active businesses snapped into each 250m cell (drives the 'defend this
+    pick' panel and an optional businesses overlay in the app)."""
+    grid["business_count"] = 0
+    if businesses is None or businesses.empty:
+        return grid
+    cells = to_grid_cells(businesses["lat"], businesses["lon"])
+    cnt = cells.groupby(["grid_x", "grid_y"]).size().rename("bc")
+    merged = grid.merge(cnt, left_on=["grid_x", "grid_y"], right_index=True, how="left")
+    grid["business_count"] = merged["bc"].fillna(0).astype(int).values
+    return grid
+
+
+# ===========================================================================
 # DOT reality-check column (diagnostic only - not used to place bins)
 # ===========================================================================
 def dot_calibration_flag(grid_df: pd.DataFrame, dot_df: pd.DataFrame) -> pd.Series:
@@ -753,6 +929,16 @@ def build_grid() -> pd.DataFrame:
         grid["near_transit"] = False
         grid["commercial_area"] = 0.0
 
+    # Usability layers (do not affect the activity score): business counts, then
+    # sanitation district + BID tags. Each fails soft to a safe default.
+    print("\nAdding usability layers (businesses, districts, BIDs)...")
+    try:
+        grid = add_business_count(grid, fetch_businesses())
+    except Exception as e:
+        log(f"WARNING: business count failed ({e}).")
+        grid["business_count"] = 0
+    grid = add_districts_and_bids(grid)
+
     # Attach the DOT reality-check column.
     grid["dot_calibration"] = dot_calibration_flag(grid, dot_df).values
 
@@ -783,12 +969,24 @@ if __name__ == "__main__":
         "eligible", "near_transit", "commercial_area",
         "score_311", "score_mta", "score_citibike", "score_basket_need",
         "lodes_pop", "proxy_divergence", "equity_floored", "dot_calibration",
+        "district", "in_bid", "business_count",
     ]
     grid[keep_cols].to_csv(OUT_CSV, index=False)
 
     # Export subway entrances as a CSV the app bundles for its eligibility layer.
     try:
         fetch_subway_entrances().to_csv(DATA_DIR / "subway_entrances.csv", index=False)
+    except Exception:
+        pass
+
+    # Export named street corners + businesses for the app's corner-snapping and
+    # business overlay (bundled so the app never downloads them at runtime).
+    try:
+        fetch_intersections().to_csv(DATA_DIR / "intersections.csv", index=False)
+    except Exception:
+        pass
+    try:
+        fetch_businesses().to_csv(DATA_DIR / "businesses.csv", index=False)
     except Exception:
         pass
 
