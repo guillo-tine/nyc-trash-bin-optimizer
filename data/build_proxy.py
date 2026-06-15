@@ -744,6 +744,12 @@ if __name__ == "__main__":
     ]
     grid[keep_cols].to_csv(OUT_CSV, index=False)
 
+    # Export subway entrances as a CSV the app bundles for its eligibility layer.
+    try:
+        fetch_subway_entrances().to_csv(DATA_DIR / "subway_entrances.csv", index=False)
+    except Exception:
+        pass
+
     print(f"\nSaved: {OUT_CSV}")
     print(f"Rows:  {len(grid):,}")
     print(f"Boroughs: {grid['borough'].value_counts().to_dict()}")

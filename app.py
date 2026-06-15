@@ -52,6 +52,7 @@ ACTIVITY_CSV   = os.path.join(DATA_DIR, "pedestrian_counts.csv")
 PROXY_GRID_CSV = os.path.join(DATA_DIR, "activity_grid.csv")     # the better composite data (built offline)
 BINS_CSV       = os.path.join(DATA_DIR, "litter_baskets.csv")
 DOT_CSV        = os.path.join(DATA_DIR, "dot_counts.csv")        # saved copy of the 114 DOT points
+SUBWAY_CSV     = os.path.join(DATA_DIR, "subway_entrances.csv")  # subway entrances (transit signal)
 SOCRATA_BASE   = "https://data.cityofnewyork.us/resource"
 
 GRID_SIZE_M  = 250        # each cell is 250m x 250m
@@ -158,6 +159,17 @@ def build_source_options(proxy, nypd):
     if nypd is not None:
         options["NYPD incidents (911 calls)"] = ("nypd", None)
     return options
+
+
+@st.cache_data(show_spinner=False)
+def load_subway_entrances() -> pd.DataFrame:
+    """The subway entrance points (lat/lon), bundled so the eligibility layer can
+    show the 'near transit' signal. Returns an empty frame if the file is missing."""
+    if os.path.exists(SUBWAY_CSV):
+        df = pd.read_csv(SUBWAY_CSV)
+        df["borough"] = assign_borough(df["lat"], df["lon"])
+        return df
+    return pd.DataFrame(columns=["lat", "lon", "borough"])
 
 
 def activity_input(options, choice, proxy, nypd):
@@ -357,7 +369,7 @@ def prepare_candidates(ped_df: pd.DataFrame, bins_df: pd.DataFrame):
 
     keep = ["lat", "lon", "borough", "activity_score", "nearest_bin_m"]
     # Carry DSNY-eligibility columns through if the grid has them (composite sources).
-    for extra in ("eligible", "commercial_area"):
+    for extra in ("eligible", "near_transit", "commercial_area"):
         if extra in cand.columns:
             keep.append(extra)
     return cand[keep].reset_index(drop=True), bins.reset_index(drop=True)
@@ -461,12 +473,16 @@ def thin_points(df: pd.DataFrame, cap: int) -> pd.DataFrame:
 
 def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
              dot_df: pd.DataFrame | None = None,
-             cells_df: pd.DataFrame | None = None, show_all: bool = False) -> folium.Map:
+             cells_df: pd.DataFrame | None = None, show_all: bool = False,
+             show_eligibility: bool = False, entrances_df: pd.DataFrame | None = None) -> folium.Map:
     """Build the Folium map: blue DOT circles (optional), red bins, green suggestions.
 
     When show_all is True ("Visualize everything"):
       • draw an activity HEATMAP of every cell (the input the whole tool is built on)
       • draw ALL existing bins and ALL suggestions (caps lifted)
+    When show_eligibility is True:
+      • draw a green heatmap of commercial floor area (the "businesses" signal)
+      • draw subway entrances as purple dots (the "near transit" signal)
     """
     center_lat, center_lon, zoom = BOROUGH_CENTERS.get(borough, BOROUGH_CENTERS["All Boroughs"])
     fmap = folium.Map(location=[center_lat, center_lon], zoom_start=zoom, tiles="cartodbpositron")
@@ -480,6 +496,24 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
         heat_points = [[row.lat, row.lon, float(w / top)]
                        for row, w in zip(cells_df.itertuples(), scores)]
         HeatMap(heat_points, radius=12, blur=15, min_opacity=0.25).add_to(fmap)
+
+    # Eligibility layer: show WHY cells qualify under DSNY rules.
+    #   green heat = commercial floor area (where the businesses are)
+    #   purple dots = subway entrances (the "near transit" signal)
+    if show_eligibility and cells_df is not None and "commercial_area" in cells_df.columns:
+        commercial = cells_df[cells_df["commercial_area"] > 0]
+        if len(commercial):
+            from folium.plugins import HeatMap
+            top = float(commercial["commercial_area"].max()) or 1.0
+            pts = [[r.lat, r.lon, float(r.commercial_area / top)] for r in commercial.itertuples()]
+            HeatMap(pts, radius=14, blur=18, min_opacity=0.2,
+                    gradient={0.2: "#c8f7c5", 0.5: "#46c06a", 1.0: "#0a7d2c"}).add_to(fmap)
+    if show_eligibility and entrances_df is not None and len(entrances_df):
+        for e in entrances_df.itertuples():
+            folium.CircleMarker(
+                [e.lat, e.lon], radius=3, color="#6f42c1", weight=0, fill=True, fill_opacity=0.7,
+                popup="Subway entrance (a 'near transit' signal for eligibility)",
+            ).add_to(fmap)
 
     # In "everything" mode we lift the drawing caps so nothing is hidden.
     bin_cap  = 12000 if show_all else MAP_BIN_CAP
@@ -511,16 +545,29 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
         priority = int(getattr(s, "priority", 50))
         radius = 4 + 5 * (priority / 100)
         opacity = 0.45 + 0.45 * (priority / 100)
-        popup = folium.Popup(
+
+        popup_html = (
             f"<b>Suggested new bin</b><br/>"
             f"Priority: <b>{priority}</b>/100<br/>"
             f"Activity index: <b>{s.activity_index}</b>/100<br/>"
-            f"Nearest existing bin: <b>{s.nearest_bin_m:.0f} m</b> ({feet:.0f} ft)",
-            max_width=280,
+            f"Nearest existing bin: <b>{s.nearest_bin_m:.0f} m</b> ({feet:.0f} ft)"
         )
+        # If the grid carries DSNY signals, show WHY this spot qualifies.
+        eligible = getattr(s, "eligible", None)
+        if eligible is not None:
+            near = bool(getattr(s, "near_transit", False))
+            comm = float(getattr(s, "commercial_area", 0) or 0)
+            popup_html += (
+                "<hr style='margin:4px 0'>"
+                f"<b>Why it's DSNY-eligible</b><br/>"
+                f"Commercial / mixed-use here: <b>{'Yes' if comm > 0 else 'No'}</b><br/>"
+                f"Near a subway entrance: <b>{'Yes' if near else 'No'}</b><br/>"
+                f"Commercial floor area: <b>{comm:,.0f} sq ft</b>"
+            )
+
         folium.CircleMarker(
             [s.lat, s.lon], radius=radius, color="#00aa44", weight=0, fill=True, fill_opacity=opacity,
-            popup=popup, tooltip=f"Priority {priority}/100",
+            popup=folium.Popup(popup_html, max_width=300), tooltip=f"Priority {priority}/100",
         ).add_to(fmap)
 
     return fmap
@@ -611,6 +658,16 @@ with st.sidebar:
         ),
     )
 
+    show_eligibility = st.checkbox(
+        "Show eligibility signals", value=False,
+        help=(
+            "Reveals the data behind the DSNY rule: a green heatmap of commercial floor "
+            "area (where the businesses are) and purple dots for subway entrances (the "
+            "'near transit' signal). Each green suggestion's popup also explains why it "
+            "qualifies."
+        ),
+    )
+
     show_dot = st.checkbox(
         "Show DOT verified pedestrian counts", value=False,
         help=(
@@ -643,6 +700,7 @@ except ValueError as e:
     st.stop()
 
 dot_all = load_dot_counts()
+entrances_all = load_subway_entrances()
 
 # Sensitivity 1-10 becomes a 0-100 cutoff:
 #   sensitivity 1  -> cutoff 90 (only the top 10% busiest cells)
@@ -660,6 +718,7 @@ if scope_bins.empty:
     scope_bins = bins_df
 scope_cells = cand_df if borough == "All Boroughs" else cand_df[cand_df["borough"] == borough]
 dot_scope = dot_all if borough == "All Boroughs" else dot_all[dot_all["borough"] == borough]
+ent_scope = entrances_all if borough == "All Boroughs" else entrances_all[entrances_all["borough"] == borough]
 
 # ---- Layout: map on the left, summary on the right ----
 left, right = st.columns([2, 1], gap="large")
@@ -671,6 +730,8 @@ with left:
         legend += " Blue circles are DOT pedestrian counts."
     if show_all:
         legend += " The heat shows activity level."
+    if show_eligibility:
+        legend += " Green heat shows commercial floor area (businesses); purple dots are subway entrances."
     st.caption(legend + " Click any dot for details.")
     if apply_gate:
         if "eligible" in cand_df.columns:
@@ -689,7 +750,9 @@ with left:
     # so panning/zooming the map doesn't trigger a full app rerun.
     st_folium(
         make_map(scope_bins, suggested, borough, dot_scope if show_dot else None,
-                 cells_df=scope_cells, show_all=show_all),
+                 cells_df=scope_cells, show_all=show_all,
+                 show_eligibility=show_eligibility,
+                 entrances_df=ent_scope if show_eligibility else None),
         width=900, height=650, returned_objects=[],
     )
 
