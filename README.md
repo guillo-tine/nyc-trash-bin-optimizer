@@ -26,6 +26,25 @@ using the city's own open data.
 4. **Rank** - give each suggestion a **Priority score (0-100)** so a planner knows
    which to build first, and draw everything on a map.
 
+## Built for DSNY (what it does beyond the four steps)
+
+- **Task presets** - pick a job (find new corners, rebalance existing bins, plan a
+  district, respond to complaints) and the rules set themselves.
+- **Corner-level output** - each suggestion snaps to a real named street intersection
+  (e.g. "Broadway & W 145 St"), from 59k corners built off the city street centerline.
+- **DSNY eligibility gate** - keep only commercial / mixed-use or near-transit corners
+  (PLUTO land use + subway entrances); drop residential, parks, industrial, highway.
+- **Calibrated spacing** - the default minimum gap is the *measured* median spacing of
+  existing commercial-area baskets, not an invented number.
+- **Relocation mode (net-zero)** - pair top corners with low-value movable bins.
+- **Budget cap, per-district shortlist, district scorecard** (baskets per 1,000
+  residents + underserved rank), **household-misuse risk flag**, **confidence flag**.
+- **Validation panel** - basket recovery rate and agreement with the 114 real DOT counts.
+- **Search box, clickable existing baskets, business overlay (DOHMH), BID tagging.**
+- **Exports** - CSV, GeoJSON (for GIS), and a printable HTML report.
+
+All layers are bundled, so the app downloads nothing at runtime.
+
 ## Data sources (the activity layer is a *proxy*, not a true count)
 
 No dataset measures citywide pedestrian foot traffic, so the app uses proxies you can
