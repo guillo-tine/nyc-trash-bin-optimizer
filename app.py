@@ -37,6 +37,7 @@ from pyproj import Transformer             # converts lat/lon to meters
 
 import streamlit as st
 import folium
+from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 import streamlit.components.v1 as components
 
@@ -859,9 +860,9 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
              businesses_df: pd.DataFrame | None = None,
              relocations_df: pd.DataFrame | None = None,
              center: tuple | None = None) -> folium.Map:
-    """Build the Folium map: blue DOT circles (optional), red bins, green suggestions.
+    """Build the Folium map: blue existing bins, orange suggestions, optional overlays.
 
-    When show_all is True ("Visualize everything"):
+    When show_all is True (the "All-cell heatmap" layer):
       • draw an activity HEATMAP of every cell (the input the whole tool is built on)
       • draw ALL existing bins and ALL suggestions (caps lifted)
     When show_eligibility is True:
@@ -876,7 +877,6 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
     # Activity heatmap (drawn first, underneath everything) - shows the raw activity
     # surface that feeds the whole model. Each cell is weighted by its activity score.
     if show_all and cells_df is not None and len(cells_df):
-        from folium.plugins import HeatMap
         scores = cells_df["activity_score"].astype(float)
         top = scores.max() or 1.0
         heat_points = [[row.lat, row.lon, float(w / top)]
@@ -889,7 +889,6 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
     if show_eligibility and cells_df is not None and "commercial_area" in cells_df.columns:
         commercial = cells_df[cells_df["commercial_area"] > 0]
         if len(commercial):
-            from folium.plugins import HeatMap
             top = float(commercial["commercial_area"].max()) or 1.0
             pts = [[r.lat, r.lon, float(r.commercial_area / top)] for r in commercial.itertuples()]
             HeatMap(pts, radius=14, blur=18, min_opacity=0.2,
@@ -983,9 +982,8 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
       background:rgba(255,255,255,0.92);padding:8px 10px;border:1px solid #bbb;border-radius:6px;
       font:12px Arial,sans-serif;color:#222;line-height:1.6">
       <span style="color:{COLORS['bin']}">&#9679;</span> existing bin
-      &nbsp;<span style="color:{COLORS['suggestion']}">&#9679;</span> suggested corner<br/>
-      <span style="color:{COLORS['misuse']}">&#9711;</span> ring = household-misuse risk
-      (residential; a basket here may collect household trash)<br/>
+      &nbsp;<span style="color:{COLORS['suggestion']}">&#9679;</span> suggested corner
+      &nbsp;<span style="color:{COLORS['misuse']}">&#9711;</span> misuse risk<br/>
       <span style="color:{COLORS['business']}">&#9679;</span> business
       &nbsp;<span style="color:{COLORS['move']}">&#9679;</span> move
       &nbsp;<span style="color:{COLORS['dot']}">&#9679;</span> DOT
@@ -1306,7 +1304,7 @@ if find_query and find_query.strip():
 elif not show_all and len(suggested) > MAP_SUGG_CAP:
     st.caption(f"Showing the top {MAP_SUGG_CAP} of {len(suggested):,} suggestions by priority.")
 
-# Height-only (no fixed width) keeps the map responsive on a phone.
+# use_container_width fills the page on desktop and scales down on a phone.
 st_folium(
     make_map(scope_bins, suggested, borough, dot_scope if show_dot else None,
              cells_df=scope_cells, show_all=show_all,
@@ -1315,7 +1313,7 @@ st_folium(
              businesses_df=biz_scope if show_business else None,
              relocations_df=relocations if relocation_mode else None,
              center=search_center),
-    height=520, returned_objects=[],
+    use_container_width=True, height=600, returned_objects=[],
 )
 
 # One compact summary line + a plain description of the current data source.
