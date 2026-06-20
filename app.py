@@ -38,6 +38,7 @@ from pyproj import Transformer             # converts lat/lon to meters
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
+import streamlit.components.v1 as components
 
 
 # ===========================================================================
@@ -1004,32 +1005,85 @@ st.caption(
     "and ranks them so the city knows where to add baskets first. Built only on NYC open data."
 )
 
-with st.expander("How to read this, and what the words mean"):
-    st.markdown(
-        "**The idea in one line:** a corner is suggested when it is *busy* **and** *far from "
-        "an existing bin*. Busy alone isn't enough; far-from-a-bin alone isn't enough.\n\n"
-        "**How to use it:** pick a goal under *What do you want to do?*, choose a borough, and "
-        "read the ranked list under the map. Click any dot to see why it was chosen.\n\n"
-        "**What the words mean**\n"
-        "- **Activity index (0-100):** how busy a corner is, as a *percentile*: 80 means "
-        "busier than 80% of corners in view. It's a stand-in for foot traffic, built from the "
-        "data sources below (there is no citywide pedestrian count).\n"
-        "- **Walking distance to nearest bin:** distance along real streets (not straight-line) "
-        "to the closest existing basket, computed over the city street network.\n"
-        "- **DSNY-eligible:** the kind of corner the city actually baskets: commercial / "
-        "mixed-use, or near a subway entrance or bus stop, and *not* mid-residential, parks, "
-        "industrial, or highway land. Found from city land-use (PLUTO) + transit locations.\n"
-        "- **Priority (0-100):** the ranking score = mostly *activity* + *coverage gap*, plus a "
-        "small commercial nudge. Higher = build sooner.\n"
-        "- **Misuse risk:** a residential spot where a public basket tends to collect household "
-        "trash (shown as a hollow ring on the map).\n"
-        "- **Confidence:** lower when the data sources disagree about how busy a spot is.\n"
-        "- **Recommended baskets:** 1-3, based on how busy the corner is.\n\n"
-        "**Where the data comes from:** NYC Open Data: 311 complaints, PLUTO land use, MTA "
-        "subway + bus stops, DOT pedestrian counts, DOHMH businesses, DSNY basket inventory + "
-        "districts, and the city street centerline. Everything is bundled, so nothing downloads "
-        "while you use it."
-    )
+# A small responsive flow diagram of how a corner becomes a suggested bin.
+_BOX = ('<rect x="20" y="{y}" width="300" height="54" rx="9" fill="{fill}" '
+        'stroke="{stroke}" stroke-width="1.5"/>'
+        '<text x="170" y="{t1}" text-anchor="middle" font-size="14" font-weight="bold" '
+        'fill="#222">{l1}</text>'
+        '<text x="170" y="{t2}" text-anchor="middle" font-size="11" fill="#555">{l2}</text>')
+_steps = [
+    (8,   "Every 250 m block in the city", "the starting point",            "#eeeeee", "#bbb"),
+    (76,  "1. Busy enough?",  "activity score from the data you pick",      "#dbeafe", "#60a5fa"),
+    (144, "2. Far from a bin?", "walking distance along real streets",      "#dbeafe", "#60a5fa"),
+    (212, "3. Right kind of corner?", "DSNY-eligible: shops / transit",     "#dbeafe", "#60a5fa"),
+    (280, "4. Rank by priority", "busiest + most underserved go first",     "#ffedd5", "#f59e0b"),
+    (348, "5. Snap to the nearest real corner", "e.g. Broadway & W 145 St", "#ffedd5", "#f59e0b"),
+]
+_boxes = "".join(_BOX.format(y=y, t1=y + 23, t2=y + 41, l1=l1, l2=l2, fill=f, stroke=s)
+                 for (y, l1, l2, f, s) in _steps)
+_arrows = "".join(f'<line x1="170" y1="{y2}" x2="170" y2="{y2 + 14}" stroke="#999" '
+                  f'stroke-width="2" marker-end="url(#arr)"/>'
+                  for y2 in (62, 130, 198, 266, 334))
+FLOW_SVG = f"""<div style="font-family:Arial,Helvetica,sans-serif;text-align:center">
+<svg viewBox="0 0 340 470" width="100%" style="max-width:360px">
+  <defs><marker id="arr" markerWidth="9" markerHeight="9" refX="4" refY="4" orient="auto">
+    <path d="M0,0 L8,4 L0,8 z" fill="#999"/></marker></defs>
+  {_boxes}{_arrows}
+  <circle cx="170" cy="437" r="11" fill="#E69F00"/>
+  <text x="170" y="442" text-anchor="middle" font-size="13" font-weight="bold" fill="#fff">$</text>
+  <text x="170" y="466" text-anchor="middle" font-size="12" fill="#333">= a suggested bin (orange dot)</text>
+</svg></div>"""
+
+with st.expander("How this works (start here)"):
+    tab_find, tab_colors, tab_terms = st.tabs(
+        ["How a bin is found", "What the colors mean", "Word-by-word"])
+
+    with tab_find:
+        st.markdown(
+            "A corner is suggested only when **all** of these are true. We start with every "
+            "small block in the city and keep narrowing down:")
+        components.html(FLOW_SVG, height=480)
+        st.markdown(
+            "1. **Busy enough.** Each block gets a 0-100 busy-ness score from the data source "
+            "you pick (311 calls, subway and bus activity, etc.), ranked against nearby blocks.\n"
+            "2. **Far from a bin.** We measure the *walking* distance along real streets to the "
+            "nearest existing basket. Close to a bin = already covered, so it's skipped.\n"
+            "3. **Right kind of corner** (if eligibility is on). We keep commercial / mixed-use "
+            "corners and ones near a subway or bus stop, and drop mid-residential blocks, parks, "
+            "industrial land, and highways, because that's where the city actually puts baskets.\n"
+            "4. **Ranked by priority** so the busiest, most-underserved corners are at the top.\n"
+            "5. **Snapped to the nearest real intersection** and shown as an orange dot.")
+
+    with tab_colors:
+        st.markdown(
+            "- **Blue dot** = an existing trash bin.\n"
+            "- **Orange dot** = a suggested new corner (brighter = higher priority).\n"
+            "- **Hollow ring** = a **misuse-risk** corner (see the last tab).\n"
+            "- **Green line** = in Relocation mode, a bin to move and where to move it.\n"
+            "- Optional overlays live in *Advanced settings, Map layers*: businesses (sky-blue), "
+            "the 114 real DOT pedestrian counts (grey), subway entrances (purple), or a heatmap.")
+
+    with tab_terms:
+        st.markdown(
+            "- **Activity index (0-100):** how busy a corner is, as a *percentile*. 80 means "
+            "busier than 80% of corners in view. It stands in for foot traffic (the city has no "
+            "block-by-block pedestrian count), built from the data source you pick.\n"
+            "- **Walking distance to nearest bin:** distance *along streets* (not a straight "
+            "line) to the closest existing basket, so a bin across a highway doesn't count as near.\n"
+            "- **Priority (0-100):** the ranking score: mostly *how busy* plus *how far from a "
+            "bin*, with a small bump for commercial corners. Higher = build sooner.\n"
+            "- **Misuse risk (the hollow ring):** the corner sits in a mostly **residential** "
+            "area with little or no commercial activity around it. Public baskets on blocks like "
+            "that tend to get filled with **household garbage**, so the city often ends up "
+            "pulling them back out. The ring is a warning, not a hard 'no'.\n"
+            "- **DSNY-eligible:** the corner is a type the city actually baskets (commercial / "
+            "mixed-use, or near a subway or bus stop). Found from city land-use records (PLUTO) "
+            "plus transit locations.\n"
+            "- **Confidence:** lower when the different data sources disagree about how busy the "
+            "spot is.\n"
+            "- **Recommended baskets (1-3):** how many to place, based on how busy the corner is.\n\n"
+            "*Data: NYC Open Data (311, PLUTO, MTA subway + bus, DOT counts, DOHMH businesses, "
+            "DSNY baskets + districts, street centerline). All bundled; nothing downloads as you use it.*")
 
 # Load the data first so the dropdown can list whichever sources exist.
 with st.spinner("Loading NYC data…"):
