@@ -982,8 +982,9 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
       background:rgba(255,255,255,0.92);padding:8px 10px;border:1px solid #bbb;border-radius:6px;
       font:12px Arial,sans-serif;color:#222;line-height:1.6">
       <span style="color:{COLORS['bin']}">&#9679;</span> existing bin
-      &nbsp;<span style="color:{COLORS['suggestion']}">&#9679;</span> suggested corner
-      &nbsp;<span style="color:{COLORS['misuse']}">&#9711;</span> misuse risk<br/>
+      &nbsp;<span style="color:{COLORS['suggestion']}">&#9679;</span> suggested corner<br/>
+      <span style="color:{COLORS['misuse']}">&#9711;</span> ring = household-misuse risk
+      (residential; a basket here may collect household trash)<br/>
       <span style="color:{COLORS['business']}">&#9679;</span> business
       &nbsp;<span style="color:{COLORS['move']}">&#9679;</span> move
       &nbsp;<span style="color:{COLORS['dot']}">&#9679;</span> DOT
@@ -999,9 +1000,36 @@ st.set_page_config(page_title="NYC Trash Bin Optimizer", layout="wide")
 
 st.title("NYC Trash Bin Optimizer")
 st.caption(
-    "This map points out blocks that might need more public trash bins. It looks for areas "
-    "that are busy but don't have many bins nearby, all using the city's public data."
+    "Finds street corners that are busy with people but far from any existing trash bin, "
+    "and ranks them so the city knows where to add baskets first. Built only on NYC open data."
 )
+
+with st.expander("How to read this, and what the words mean"):
+    st.markdown(
+        "**The idea in one line:** a corner is suggested when it is *busy* **and** *far from "
+        "an existing bin*. Busy alone isn't enough; far-from-a-bin alone isn't enough.\n\n"
+        "**How to use it:** pick a goal under *What do you want to do?*, choose a borough, and "
+        "read the ranked list under the map. Click any dot to see why it was chosen.\n\n"
+        "**What the words mean**\n"
+        "- **Activity index (0-100):** how busy a corner is, as a *percentile*: 80 means "
+        "busier than 80% of corners in view. It's a stand-in for foot traffic, built from the "
+        "data sources below (there is no citywide pedestrian count).\n"
+        "- **Walking distance to nearest bin:** distance along real streets (not straight-line) "
+        "to the closest existing basket, computed over the city street network.\n"
+        "- **DSNY-eligible:** the kind of corner the city actually baskets: commercial / "
+        "mixed-use, or near a subway entrance or bus stop, and *not* mid-residential, parks, "
+        "industrial, or highway land. Found from city land-use (PLUTO) + transit locations.\n"
+        "- **Priority (0-100):** the ranking score = mostly *activity* + *coverage gap*, plus a "
+        "small commercial nudge. Higher = build sooner.\n"
+        "- **Misuse risk:** a residential spot where a public basket tends to collect household "
+        "trash (shown as a hollow ring on the map).\n"
+        "- **Confidence:** lower when the data sources disagree about how busy a spot is.\n"
+        "- **Recommended baskets:** 1-3, based on how busy the corner is.\n\n"
+        "**Where the data comes from:** NYC Open Data: 311 complaints, PLUTO land use, MTA "
+        "subway + bus stops, DOT pedestrian counts, DOHMH businesses, DSNY basket inventory + "
+        "districts, and the city street centerline. Everything is bundled, so nothing downloads "
+        "while you use it."
+    )
 
 # Load the data first so the dropdown can list whichever sources exist.
 with st.spinner("Loading NYC data…"):
@@ -1070,12 +1098,6 @@ with st.sidebar:
                 continue
             st.session_state[k] = v
 
-    st.markdown("**Data & scope**")
-    source_choice = st.selectbox(
-        "Activity data source", list(source_options.keys()), key="source",
-        help="Which data stands in for where people are. Composite (311 + transit) is best; "
-             "NYPD misses quiet residential areas. Add more with `python data/build_proxy.py`.",
-    )
     borough = st.selectbox(
         "Borough",
         ["All Boroughs", "Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"],
@@ -1088,61 +1110,59 @@ with st.sidebar:
         help="Type a street or corner (e.g. 'Steinway' or 'Broadway & W 145'). The map "
              "recenters on the first match.",
     )
-    sensitivity = st.slider(
-        "Sensitivity", 1, 10, 5,
-        help="How busy an area must be to be flagged. Low (1-3) = fewer, stronger picks; "
-             "high (8-10) = more picks.",
-    )
-
-    st.divider()
-    st.markdown("**Placement rules**")
-    min_distance_m = st.slider(
-        "Minimum gap from existing bin (meters)", 25, 800, value=default_gap, step=25,
-        help=f"A spot is only suggested if no bin is within this distance. The default "
-             f"({default_gap} m) is the measured median spacing of existing commercial-area "
-             "DSNY baskets, so it matches how the city already spaces them.",
-    )
-    apply_gate = st.checkbox(
-        "Apply DSNY eligibility rules", key="gate",
-        help="Suggest only commercial / mixed-use or near-transit corners, not residential, "
-             "parks, industrial, or highway cells. Uses NYC PLUTO land use + subway entrances.",
-    )
-    prioritize_commercial = st.checkbox(
-        "Prioritize commercial corners", key="commercial",
-        help="Among equally busy, equally underserved spots, rank the one with more retail / "
-             "office floor area higher (adds a 0.15 commercial term).",
-    )
-
-    st.divider()
-    st.markdown("**Output**")
     district_choice = st.selectbox(
         "Sanitation district", ["All districts"] + district_list, key="district",
         help="Narrow the shortlist, export, and report to one DSNY district (e.g. BKN03).",
     ) if district_list else "All districts"
-    budget = st.number_input(
-        "Budget: number of new baskets (0 = no limit)", 0, 2000, 0, 5,
-        help="Fund a fixed number? The tool returns exactly that many, highest priority first.",
-    )
-    snap_corners = st.checkbox(
-        "Snap suggestions to nearest street corner", key="snap",
-        help="Move each suggestion to the nearest real intersection (within 180 m) and label "
-             "it, e.g. 'Broadway & W 145 St'.",
-    )
-    relocation_mode = st.checkbox(
-        "Relocation mode (net-zero: move low-value bins)", key="relocation",
-        help="Pair each top corner with the nearest low-value existing bin to move there, so a "
-             "new corner costs nothing. Draws move lines + a relocation table.",
-    )
 
-    st.divider()
-    st.markdown("**Map layers**")
-    layers = st.multiselect(
-        "Show on map",
-        ["Eligibility signals", "Businesses", "DOT counts", "All-cell heatmap"],
-        help="Optional overlays. Eligibility = commercial heat + subway entrances. "
-             "Businesses = DOHMH dots. DOT = the 114 real counts. All-cell heatmap draws "
-             "every cell and lifts the caps (slower; pick one borough).",
-    )
+    st.caption("Pick a goal and a borough above. The options below are optional fine-tuning.")
+
+    with st.expander("Advanced settings"):
+        source_choice = st.selectbox(
+            "Activity data source", list(source_options.keys()), key="source",
+            help="Which data stands in for where people are. Composite (311 + transit) is "
+                 "best; NYPD misses quiet residential areas.",
+        )
+        sensitivity = st.slider(
+            "Sensitivity", 1, 10, 5,
+            help="How busy an area must be to be flagged. Low (1-3) = fewer, stronger picks; "
+                 "high (8-10) = more picks.",
+        )
+        min_distance_m = st.slider(
+            "Minimum gap from existing bin (meters)", 25, 800, value=default_gap, step=25,
+            help=f"A spot is only suggested if no bin is within this distance. The default "
+                 f"({default_gap} m) is the measured median spacing of existing commercial-area "
+                 "DSNY baskets.",
+        )
+        apply_gate = st.checkbox(
+            "Apply DSNY eligibility rules", key="gate",
+            help="Suggest only commercial / mixed-use, near-transit, or near-bus corners; not "
+                 "residential, parks, industrial, or highway cells.",
+        )
+        prioritize_commercial = st.checkbox(
+            "Prioritize commercial corners", key="commercial",
+            help="Among equally busy, equally underserved spots, rank the one with more retail "
+                 "/ office floor area higher.",
+        )
+        budget = st.number_input(
+            "Budget: number of new baskets (0 = no limit)", 0, 2000, 0, 5,
+            help="Fund a fixed number? The tool returns exactly that many, highest priority first.",
+        )
+        snap_corners = st.checkbox(
+            "Snap suggestions to nearest street corner", key="snap",
+            help="Move each suggestion to the nearest real intersection and label it, e.g. "
+                 "'Broadway & W 145 St'.",
+        )
+        relocation_mode = st.checkbox(
+            "Relocation mode (move low-value bins, net-zero)", key="relocation",
+            help="Pair each top corner with the nearest low-value existing bin to move there, "
+                 "so a new corner costs nothing.",
+        )
+        layers = st.multiselect(
+            "Map layers", ["Eligibility signals", "Businesses", "DOT counts", "All-cell heatmap"],
+            help="Optional overlays. Eligibility = commercial heat + subway entrances. "
+                 "Businesses = DOHMH dots. DOT = the 114 real counts. All-cell heatmap is slower.",
+        )
     show_eligibility = "Eligibility signals" in layers
     show_business    = "Businesses" in layers
     show_dot         = "DOT counts" in layers
@@ -1218,135 +1238,89 @@ if find_query and find_query.strip() and len(intersections_all):
     if len(hits):
         search_center = (float(hits["lat"].mean()), float(hits["lon"].mean()), 15)
 
-# ---- Layout: map on the left, summary on the right ----
-left, right = st.columns([2, 1], gap="large")
+# ---- Main view (single column, mobile friendly) ----
+st.subheader("Coverage map")
+map_caption = "Blue = existing bins, orange = suggested corners (brighter = higher priority)."
+if relocation_mode:
+    map_caption += " Green lines = a bin to move and where to move it."
+st.caption(map_caption + " Tap a dot for details; a color key sits on the map.")
+if apply_gate and "eligible" not in cand_df.columns:
+    st.caption("Eligibility rules need a Composite source, so they don't apply to NYPD data.")
+if find_query and find_query.strip():
+    st.caption(f"Centered on '{find_query.strip()}'." if search_center
+               else f"No street or corner matched '{find_query.strip()}'.")
+elif not show_all and len(suggested) > MAP_SUGG_CAP:
+    st.caption(f"Showing the top {MAP_SUGG_CAP} of {len(suggested):,} suggestions by priority.")
 
-with left:
-    st.subheader("Coverage Map")
-    legend = "Blue dots are existing bins. Orange dots are suggested new spots (brighter means higher priority)."
-    if show_dot and len(dot_scope):
-        legend += " Grey circles are DOT pedestrian counts."
-    if show_all:
-        legend += " The heat shows activity level."
-    if show_eligibility:
-        legend += " Green heat shows commercial floor area (businesses); purple dots are subway entrances."
-    if show_business:
-        legend += " Sky-blue dots are nearby businesses."
-    if relocation_mode:
-        legend += " Green lines show a bin to move and the corner to move it to."
-    if snap_corners:
-        legend += " Suggestions sit on the nearest real street corner."
-    st.caption(legend + " Click any dot for details. See the key on the map.")
-    if apply_gate:
-        if "eligible" in cand_df.columns:
-            st.caption("DSNY eligibility rules are ON: showing only commercial or transit-eligible "
-                       "corners (residential, parks, industrial, and highway cells are removed).")
-        else:
-            st.caption("DSNY eligibility rules need a Composite source (PLUTO land use); they don't "
-                       "apply to the NYPD source.")
-    if show_all:
-        st.caption("Showing everything: the activity heatmap, all bins, and all suggestions.")
-        if borough == "All Boroughs":
-            st.caption("Tip: pick a single borough if the full-city view feels slow.")
-    elif len(suggested) > MAP_SUGG_CAP:
-        st.caption(f"Showing the top {MAP_SUGG_CAP} suggestions by priority (of {len(suggested):,} total).")
-    if find_query and find_query.strip():
-        st.caption(f"Centered on '{find_query.strip()}'." if search_center
-                   else f"No street or corner matched '{find_query.strip()}'.")
-    # returned_objects=[] tells st_folium not to send map state back to Python,
-    # so panning/zooming the map doesn't trigger a full app rerun.
-    st_folium(
-        make_map(scope_bins, suggested, borough, dot_scope if show_dot else None,
-                 cells_df=scope_cells, show_all=show_all,
-                 show_eligibility=show_eligibility,
-                 entrances_df=ent_scope if show_eligibility else None,
-                 businesses_df=biz_scope if show_business else None,
-                 relocations_df=relocations if relocation_mode else None,
-                 center=search_center),
-        width=900, height=650, returned_objects=[],
-    )
+# Height-only (no fixed width) keeps the map responsive on a phone.
+st_folium(
+    make_map(scope_bins, suggested, borough, dot_scope if show_dot else None,
+             cells_df=scope_cells, show_all=show_all,
+             show_eligibility=show_eligibility,
+             entrances_df=ent_scope if show_eligibility else None,
+             businesses_df=biz_scope if show_business else None,
+             relocations_df=relocations if relocation_mode else None,
+             center=search_center),
+    height=520, returned_objects=[],
+)
 
-with right:
-    st.subheader("Summary")
-    st.metric("Existing bins (this view)", f"{len(scope_bins):,}")
-    st.metric("Activity cells analyzed",   f"{len(scope_cells):,}")
-    st.metric("Suggested new bins",        f"{len(suggested):,}")
+# One compact summary line + a plain description of the current data source.
+st.markdown(
+    f"**{len(suggested):,}** suggested corners &nbsp;&middot;&nbsp; "
+    f"**{len(scope_bins):,}** existing bins &nbsp;&middot;&nbsp; "
+    f"**{len(scope_cells):,}** blocks analyzed")
 
-    if len(suggested) == 0:
-        st.warning(
-            "No recommendations with these settings. Try raising **Sensitivity** "
-            "or lowering the **minimum gap**."
-        )
+composite_desc = (
+    "Mixes " + " and ".join(composite_layers) + " to estimate where people are walking."
+    if composite_layers else
+    "Mixes several NYC activity signals to estimate where people are walking."
+)
+SOURCE_BLURBS = {
+    "Composite (311 + transit)": composite_desc,
+    "Composite (per person)": "The same blend divided by how many people work and live nearby "
+        "(Census LODES), so a packed transit hub doesn't automatically outrank a quieter but "
+        "underserved neighborhood.",
+    "Basket need (311 requests + overflow)": "311 complaints that directly ask for basket "
+        "service or report overflow - the most direct public signal of where people want a basket.",
+    "311 street complaints": "Outdoor 311 reports (street/sidewalk, litter, noise) - common in "
+        "residential areas where NYPD data falls short.",
+    "Subway ridership": "Riders per station - strong near stations, weak away from them.",
+    "Citibike trips": "Trips per station - useful inside the bike network only.",
+    "NYPD incidents (911 calls)": "911 records as a stand-in for foot traffic - leans commercial, "
+        "misses quiet residential blocks.",
+}
+st.caption(f"**Source ({source_choice}):** {SOURCE_BLURBS.get(source_choice, '')}")
 
-    val = compute_validation(proxy_df, bins_raw, dot_all)
-    if val["recovery"] is not None or val["dot_corr"] is not None:
-        with st.expander("How well does this match reality?"):
-            if val["recovery"] is not None:
-                st.caption(
-                    f"**Recovery: {val['recovery'] * 100:.0f}%** of the city's "
-                    f"{val['n_bins']:,} existing baskets sit in cells the model independently "
-                    "flags as basket-worthy (busy and DSNY-eligible). Higher means the logic "
-                    "agrees with where DSNY already places baskets.")
-            if val["dot_corr"] is not None:
-                st.caption(
-                    f"**DOT agreement: Spearman r = {val['dot_corr']:.2f}** between our activity "
-                    f"rank and the {val['n_dot']} real DOT pedestrian counts (1.0 = perfect, "
-                    "0 = none).")
-            if val["holdout"] is not None:
-                st.caption(
-                    f"**Hold-out test: {val['holdout'] * 100:.0f}%** - of {val['n_holdout']:,} hidden "
-                    "baskets whose removal leaves a real gap, this share sit where the model "
-                    "independently calls for a basket (busy and eligible). Tests prediction, not "
-                    "just agreement.")
-            st.caption("These are transparent sanity checks, not a trained model's accuracy.")
+if len(suggested) == 0:
+    st.warning("No recommendations with these settings. Open **Advanced settings** and raise "
+               "**Sensitivity** or lower the **minimum gap**.")
 
-    st.divider()
-    st.caption("**How it works**")
-    st.caption(
-        f"The city is split into **250 m by 250 m squares**. Each square gets an **activity "
-        f"score from 0 to 100** based on how it ranks against the others in view. A square is "
-        f"suggested when its score is at least **{threshold_index}** and the nearest bin is more "
-        f"than **{min_distance_m} m** away."
-    )
+# How accurate is this? (validation)
+val = compute_validation(proxy_df, bins_raw, dot_all)
+if val["recovery"] is not None or val["dot_corr"] is not None:
+    with st.expander("How accurate is this? (validation)"):
+        if val["recovery"] is not None:
+            st.caption(
+                f"**Recovery: {val['recovery'] * 100:.0f}%** of the city's {val['n_bins']:,} "
+                "existing baskets sit where the model independently calls for one (busy and "
+                "eligible) - it agrees with where DSNY already places baskets.")
+        if val["dot_corr"] is not None:
+            st.caption(
+                f"**DOT agreement: r = {val['dot_corr']:.2f}** between our activity rank and the "
+                f"{val['n_dot']} real DOT pedestrian counts (1 = perfect, 0 = none).")
+        if val["holdout"] is not None:
+            st.caption(
+                f"**Hold-out test: {val['holdout'] * 100:.0f}%** - of {val['n_holdout']:,} hidden "
+                "baskets whose removal leaves a real gap, this share sit where the model "
+                "independently calls for a basket. Tests prediction, not just agreement.")
+        st.caption("Transparent sanity checks, not a trained model's accuracy.")
 
-    st.divider()
-    st.caption(f"**About the data: {source_choice}**")
-    composite_desc = (
-        "This mixes " + " and ".join(composite_layers) + " to estimate where people are walking."
-        if composite_layers else
-        "This mixes several NYC activity signals to estimate where people are walking."
-    )
-    SOURCE_BLURBS = {
-        "Composite (311 + transit)": composite_desc,
-        "Composite (per person)": "The same blend, but divided by how many people work and "
-            "live nearby (from Census LODES). This scores activity per person instead of raw "
-            "crowd size, so a packed transit hub doesn't automatically outrank a quieter "
-            "but underserved neighborhood.",
-        "Basket need (311 requests + overflow)": "Counts of 311 complaints that directly ask "
-            "for basket service: 'Litter Basket Request', 'Litter Basket Complaint', and "
-            "'Overflowing Litter Baskets'. This is the most direct public signal of where "
-            "people actually want or need a basket.",
-        "311 street complaints": "Counts of outdoor 311 reports like street and sidewalk "
-            "conditions, litter, and noise. These are common in residential areas, where the "
-            "NYPD data falls short.",
-        "Subway ridership": "How many people ride the subway at each station. It's strong near "
-            "stations and weaker once you move away from them.",
-        "Citibike trips": "How many Citibike trips start or end at each station. It's useful "
-            "inside the bike network but doesn't cover areas without stations.",
-        "NYPD incidents (911 calls)": "NYPD incident records, used as a stand-in for foot "
-            "traffic. It leans toward commercial streets and tends to miss quiet residential blocks.",
-    }
-    st.caption(SOURCE_BLURBS.get(source_choice, ""))
-    if proxy_df is None:
-        st.caption("Run `python data/build_proxy.py` to add the 311 and transit sources.")
-
-    # District scorecard: equity / coverage stats for the selected district.
-    if district_choice != "All districts":
-        sc = district_scorecard(proxy_df, bins_raw)
-        if not sc.empty and district_choice in sc.index:
-            row = sc.loc[district_choice]
-            st.divider()
-            st.caption(f"**District scorecard: {district_choice}**")
+# District scorecard: equity / coverage stats for the selected district.
+if district_choice != "All districts":
+    sc = district_scorecard(proxy_df, bins_raw)
+    if not sc.empty and district_choice in sc.index:
+        row = sc.loc[district_choice]
+        with st.expander(f"District scorecard ({district_choice})"):
             st.caption(
                 f"{int(row['baskets']):,} existing baskets &middot; "
                 f"{int(row['population']):,} day+night people &middot; "
@@ -1413,18 +1387,15 @@ st.dataframe(ranked[show_cols].head(50), use_container_width=True, hide_index=Tr
 
 scope_tag = (district_choice if district_choice != "All districts"
              else borough).replace(" ", "_").lower()
-c1, c2, c3 = st.columns(3)
-with c1:
+with st.expander("Download / export"):
     st.download_button(
-        "Download CSV", ranked[show_cols].to_csv(index=False).encode("utf-8"),
+        "CSV (spreadsheet)", ranked[show_cols].to_csv(index=False).encode("utf-8"),
         file_name=f"bin_priority_{scope_tag}.csv", mime="text/csv")
-with c2:
     st.download_button(
-        "Download GeoJSON (for GIS)", to_geojson(ranked[show_cols]).encode("utf-8"),
+        "GeoJSON (for GIS / ArcGIS)", to_geojson(ranked[show_cols]).encode("utf-8"),
         file_name=f"bin_priority_{scope_tag}.geojson", mime="application/geo+json")
-with c3:
     st.download_button(
-        "Download printable report (HTML)",
+        "Printable report (HTML → print to PDF)",
         build_report_html(ranked[show_cols], district_choice, borough,
                           source_choice, min_distance_m).encode("utf-8"),
         file_name=f"bin_report_{scope_tag}.html", mime="text/html")
