@@ -69,7 +69,9 @@ DOT_DATASET  = "cqsj-cfgu"                              # the real DOT counts ta
 ENABLE_ELIGIBILITY = os.environ.get("ENABLE_ELIGIBILITY", "1") == "1"
 PLUTO_DATASET      = "64uk-42ks"   # tabular PLUTO: land use per tax lot
 SUBWAY_ENTRANCES   = "i9wp-a4ja"   # MTA subway entrances (data.ny.gov)
+BUS_STOPS_DATASET  = "2ucp-7wg5"   # MTA bus stops (data.ny.gov) - a strong basket signal
 TRANSIT_BUFFER_M   = 400           # our own choice (DSNY publishes no buffer); ~quarter mile
+BUS_BUFFER_M       = 200           # our own choice; bus stops are a tighter, on-corner signal
 # PLUTO LandUse codes used by the gate:
 ELIGIBLE_LU      = {4, 5}          # 04 mixed residential+commercial, 05 commercial+office
 INSTITUTIONAL_LU = {8}             # 08 public facilities/institutions (hospitals, schools)
@@ -569,6 +571,7 @@ def add_eligibility(grid: pd.DataFrame) -> pd.DataFrame:
         log(f"WARNING: eligibility inputs failed ({e}). Marking all cells eligible.")
         grid["eligible"] = True
         grid["near_transit"] = False
+        grid["near_bus"] = False
         grid["commercial_area"] = 0.0
         return grid
 
@@ -608,7 +611,19 @@ def add_eligibility(grid: pd.DataFrame) -> pd.DataFrame:
     else:
         grid["near_transit"] = False
 
-    grid["eligible"] = (grid["has_comm"] | grid["has_inst"] | grid["near_transit"]) & (~grid["dominant_excluded"])
+    # near a bus stop: bus shelters/stops are classic basket locations DSNY uses.
+    bus = fetch_bus_stops()
+    if len(bus):
+        bx, by = to_m.transform(bus["lon"].values, bus["lat"].values)
+        cx = grid["grid_x"].values * GRID_SIZE_M + GRID_SIZE_M / 2
+        cy = grid["grid_y"].values * GRID_SIZE_M + GRID_SIZE_M / 2
+        dbus, _ = cKDTree(np.column_stack([bx, by])).query(np.column_stack([cx, cy]), k=1)
+        grid["near_bus"] = dbus <= BUS_BUFFER_M
+    else:
+        grid["near_bus"] = False
+
+    grid["eligible"] = ((grid["has_comm"] | grid["has_inst"] | grid["near_transit"] | grid["near_bus"])
+                        & (~grid["dominant_excluded"]))
     grid = grid.drop(columns=["gx", "gy", "has_comm", "has_inst", "excl_area", "tot_area", "dominant_excluded"],
                      errors="ignore")
     log(f"  Eligibility: {int(grid['eligible'].sum()):,}/{len(grid):,} cells pass the DSNY gate")
@@ -822,6 +837,169 @@ def dot_calibration_flag(grid_df: pd.DataFrame, dot_df: pd.DataFrame) -> pd.Seri
     return pd.Series(nearby_count, index=grid_df.index, name="dot_calibration")
 
 
+def fetch_bus_stops() -> pd.DataFrame:
+    """Unique MTA bus-stop locations (lat/lon). The raw table is per route/period, so we
+    group to distinct coordinates server-side (~16k). Cached. Graceful-empty on failure."""
+    cache = CACHE_DIR / "bus_stops.parquet"
+    if cache.exists():
+        log("Cache hit: bus_stops")
+        return pd.read_parquet(cache)
+    try:
+        r = requests.get(f"{SOCRATA_STATE}/{BUS_STOPS_DATASET}.csv",
+                         params={"$select": "latitude,longitude", "$where": "in_effect='true'",
+                                 "$group": "latitude,longitude", "$limit": 50000},
+                         headers=socrata_headers(), timeout=120)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text)).rename(columns={"latitude": "lat", "longitude": "lon"})
+        df = df.apply(pd.to_numeric, errors="coerce").dropna()
+        df.to_parquet(cache, index=False)
+        log(f"  Bus stops: {len(df):,} unique")
+        return df
+    except Exception as e:
+        log(f"  WARNING: bus stops failed ({e}).")
+        return pd.DataFrame(columns=["lat", "lon"])
+
+
+def load_bins_latlon() -> pd.DataFrame:
+    """The bundled DSNY litter baskets as lat/lon (for the walking-distance graph)."""
+    p = DATA_DIR / "litter_baskets.csv"
+    if not p.exists():
+        return pd.DataFrame(columns=["lat", "lon"])
+    b = pd.read_csv(p)
+    pt = b["point"].astype(str).str.extract(r"POINT\s*\(\s*([-\d.]+)\s+([-\d.]+)\s*\)")
+    return pd.DataFrame({"lon": pd.to_numeric(pt[0], errors="coerce"),
+                         "lat": pd.to_numeric(pt[1], errors="coerce")}).dropna()
+
+
+def fetch_centerline_segments() -> pd.DataFrame:
+    """Street segments as endpoint pairs with length (feet), for the walking graph. Cached."""
+    cache = CACHE_DIR / "centerline_segments.parquet"
+    if cache.exists():
+        log("Cache hit: centerline_segments")
+        return pd.read_parquet(cache)
+    rows, page = [], 50_000
+    for offset in range(0, 250_000, page):
+        log(f"  Downloading centerline segments (offset {offset:,})...")
+        r = requests.get(f"{SOCRATA_CITY}/{CENTERLINE_DATASET}.json",
+                         params={"$select": "the_geom,segmentlength", "$limit": page,
+                                 "$offset": offset, "$order": ":id"},
+                         headers=socrata_headers(), timeout=300)
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        for seg in batch:
+            g = seg.get("the_geom")
+            if not g:
+                continue
+            length = float(seg.get("segmentlength") or 0)
+            for line in g.get("coordinates", []):
+                if len(line) < 2:
+                    continue
+                a, b = line[0], line[-1]
+                rows.append((round(a[1], 5), round(a[0], 5), round(b[1], 5), round(b[0], 5), length))
+        if len(batch) < page:
+            break
+    df = pd.DataFrame(rows, columns=["a_lat", "a_lon", "b_lat", "b_lon", "length"])
+    df.to_parquet(cache, index=False)
+    log(f"  Centerline segments: {len(df):,}")
+    return df
+
+
+def build_walk_distances(grid: pd.DataFrame, bins: pd.DataFrame) -> np.ndarray:
+    """Per-cell WALKING distance to the nearest existing bin.
+
+    The genius bit: instead of routing from every cell, we add one virtual super-source
+    node wired (weight 0) to the network node nearest each bin, then run a SINGLE Dijkstra
+    from it. One shortest-path pass gives every street node its distance to the nearest
+    bin. Uses scipy.sparse.csgraph only (no networkx). Falls back to straight-line.
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import dijkstra
+    from scipy.spatial import cKDTree
+    from pyproj import Transformer
+    to_m = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    gx, gy = to_m.transform(grid["lon"].values, grid["lat"].values)
+    cell_xy = np.column_stack([gx, gy])
+    bx, by = to_m.transform(bins["lon"].values, bins["lat"].values) if len(bins) else ([], [])
+    bin_xy = np.column_stack([bx, by]) if len(bins) else np.empty((0, 2))
+
+    def straight_line():
+        if not len(bin_xy):
+            return np.full(len(grid), np.inf)
+        return cKDTree(bin_xy).query(cell_xy, k=1)[0]
+
+    try:
+        seg = fetch_centerline_segments()
+        if seg.empty or not len(bin_xy):
+            raise RuntimeError("no segments or bins")
+        # Map each unique endpoint coordinate to a node id.
+        node_index = {}
+        def nid(p):
+            i = node_index.get(p)
+            if i is None:
+                i = len(node_index); node_index[p] = i
+            return i
+        ai = np.fromiter((nid((la, lo)) for la, lo in zip(seg["a_lat"], seg["a_lon"])), dtype=int)
+        bi = np.fromiter((nid((la, lo)) for la, lo in zip(seg["b_lat"], seg["b_lon"])), dtype=int)
+        n = len(node_index)
+        w = seg["length"].values * 0.3048                       # feet -> meters
+        coords = np.empty((n, 2))
+        for p, i in node_index.items():
+            coords[i] = p                                       # (lat, lon)
+        nx, ny = to_m.transform(coords[:, 1], coords[:, 0])
+        node_xy = np.column_stack([nx, ny])
+
+        # Super-source node (index n) -> the node nearest each bin, weight 0.
+        src = np.unique(cKDTree(node_xy).query(bin_xy, k=1)[1])
+        rows = np.concatenate([ai, bi, np.full(len(src), n), src])
+        cols = np.concatenate([bi, ai, src, np.full(len(src), n)])
+        data = np.concatenate([w, w, np.zeros(len(src)), np.zeros(len(src))])
+        graph = csr_matrix((data, (rows, cols)), shape=(n + 1, n + 1))
+        node_dist = dijkstra(graph, indices=n, directed=False)[:n]
+
+        cn = cKDTree(node_xy).query(cell_xy, k=1)[1]            # cell -> nearest node
+        walk = node_dist[cn]
+        sl = straight_line()
+        walk = np.where(np.isfinite(walk), walk, sl)           # disconnected -> straight-line
+        return np.maximum(walk, sl)                            # walking is never shorter
+    except Exception as e:
+        log(f"WARNING: walk distances failed ({e}). Using straight-line.")
+        return straight_line()
+
+
+def fit_composite_weights(grid: pd.DataFrame, dot_df: pd.DataFrame):
+    """Fit how much each activity source counts, by NNLS against the 114 DOT counts.
+
+    Fits on percentile-ranked sources (comparable scales) so the weights are interpretable.
+    Returns (w311, wmta, wcite) summing to 1; falls back to a normalized 1/2/1.5.
+    """
+    default = np.array([1.0, 2.0, 1.5]); default = default / default.sum()
+    try:
+        if dot_df is None or not len(dot_df):
+            return tuple(default)
+        from scipy.optimize import nnls
+        from scipy.spatial import cKDTree
+        from pyproj import Transformer
+        gx = grid.index.get_level_values("grid_x").values
+        gy = grid.index.get_level_values("grid_y").values
+        cx = gx * GRID_SIZE_M + GRID_SIZE_M / 2
+        cy = gy * GRID_SIZE_M + GRID_SIZE_M / 2
+        to_m = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        dx, dy = to_m.transform(dot_df["longitude"].values, dot_df["latitude"].values)
+        di = cKDTree(np.column_stack([cx, cy])).query(np.column_stack([dx, dy]), k=1)[1]
+        R = np.column_stack([grid["score_311"].rank(pct=True).values,
+                             grid["score_mta"].rank(pct=True).values,
+                             grid["score_citibike"].rank(pct=True).values])
+        w, _ = nnls(R[di], pd.Series(dot_df["ped_count"].values).rank(pct=True).values)
+        if w.sum() <= 0:
+            return tuple(default)
+        return tuple(w / w.sum())
+    except Exception as e:
+        log(f"WARNING: weight fit failed ({e}). Using default 1/2/1.5.")
+        return tuple(default)
+
+
 # ===========================================================================
 # Combine everything into one grid (this is the heart of the script)
 # ===========================================================================
@@ -868,11 +1046,15 @@ def build_grid() -> pd.DataFrame:
     # --- Raw composite: the weighted blend of raw scores. This is the app's default
     #     activity score (unchanged from before). MTA weighted highest (real measured
     #     riders), then Citibike, then 311 as the dense base. ---
-    grid["composite_raw"] = (
-        1.0 * grid["score_311"] +
-        2.0 * grid["score_mta"] +
-        1.5 * grid["score_citibike"]
-    )
+    # Source weights are FIT to the 114 real DOT pedestrian counts (NNLS), not hand-picked,
+    # so the activity score is calibrated to measured foot traffic. Composite is a weighted
+    # blend of percentile-ranked sources (comparable scales), x100 for readable numbers.
+    w311, wmta, wcite = fit_composite_weights(grid, dot_df)
+    log(f"Source weights fit to DOT: 311={w311:.2f}, mta={wmta:.2f}, citibike={wcite:.2f}")
+    r311  = grid["score_311"].rank(pct=True)
+    rmta  = grid["score_mta"].rank(pct=True)
+    rcite = grid["score_citibike"].rank(pct=True)
+    grid["composite_raw"] = 100.0 * (w311 * r311 + wmta * rmta + wcite * rcite)
 
     # --- Per-person composite: divide each source by population FIRST, so a square is
     #     scored on activity-per-person, not raw crowd. This is the bias correction;
@@ -883,10 +1065,10 @@ def build_grid() -> pd.DataFrame:
     grid["norm_311"]      = grid["score_311"]      / denominator
     grid["norm_mta"]      = grid["score_mta"]      / denominator
     grid["norm_citibike"] = grid["score_citibike"] / denominator
-    grid["composite_perperson"] = (
-        1.0 * grid["norm_311"] +
-        2.0 * grid["norm_mta"] +
-        1.5 * grid["norm_citibike"]
+    grid["composite_perperson"] = 100.0 * (
+        w311  * grid["norm_311"].rank(pct=True) +
+        wmta  * grid["norm_mta"].rank(pct=True) +
+        wcite * grid["norm_citibike"].rank(pct=True)
     )
 
     # --- Fairness floor (applied to the per-person score): a populated square never
@@ -927,6 +1109,7 @@ def build_grid() -> pd.DataFrame:
     else:
         grid["eligible"] = True
         grid["near_transit"] = False
+        grid["near_bus"] = False
         grid["commercial_area"] = 0.0
 
     # Usability layers (do not affect the activity score): business counts, then
@@ -938,6 +1121,12 @@ def build_grid() -> pd.DataFrame:
         log(f"WARNING: business count failed ({e}).")
         grid["business_count"] = 0
     grid = add_districts_and_bids(grid)
+
+    # Walking distance to the nearest bin (one multi-source shortest path; baked in so the
+    # app never routes). This becomes the operative "nearest bin" distance.
+    print("\nComputing walking distance to nearest bin (street network)...")
+    grid["nearest_bin_walk_m"] = build_walk_distances(grid, load_bins_latlon())
+    log(f"  Walk distance: median {np.median(grid['nearest_bin_walk_m']):.0f} m")
 
     # Attach the DOT reality-check column.
     grid["dot_calibration"] = dot_calibration_flag(grid, dot_df).values
@@ -966,10 +1155,10 @@ if __name__ == "__main__":
     # Save only the columns the app + diagnostics need (this column order is fixed).
     keep_cols = [
         "lat", "lon", "borough", "activity_score", "composite_perperson",
-        "eligible", "near_transit", "commercial_area",
+        "eligible", "near_transit", "near_bus", "commercial_area",
         "score_311", "score_mta", "score_citibike", "score_basket_need",
         "lodes_pop", "proxy_divergence", "equity_floored", "dot_calibration",
-        "district", "in_bid", "business_count",
+        "district", "in_bid", "business_count", "nearest_bin_walk_m",
     ]
     grid[keep_cols].to_csv(OUT_CSV, index=False)
 

@@ -62,6 +62,17 @@ DATA_LIMIT   = 100_000    # how many rows to download from NYC Open Data
 MAP_BIN_CAP  = 3000       # most existing-bin dots we draw (just for context)
 MAP_SUGG_CAP = 300        # most suggestion dots we draw (the top ones)
 
+# Colorblind-safe palette (Okabe-Ito) - distinguishable for all common color-vision types.
+COLORS = {
+    "bin":        "#0072B2",   # blue   - existing baskets
+    "suggestion": "#E69F00",   # orange - suggested corners
+    "misuse":     "#D55E00",   # vermillion ring - household-misuse risk
+    "business":   "#56B4E9",   # sky    - businesses
+    "dot":        "#555555",   # grey   - DOT counts
+    "subway":     "#CC79A7",   # purple - subway entrances
+    "move":       "#009E73",   # green  - relocation lines
+}
+
 # Rough rectangle (lat_min, lat_max, lon_min, lon_max) for each borough.
 # Used to label a point with the borough it falls inside.
 BOROUGH_BOUNDS = {
@@ -395,12 +406,19 @@ def prepare_candidates(ped_df: pd.DataFrame, bins_df: pd.DataFrame):
     else:
         cand["nearest_bin_m"] = np.inf
 
+    # Walking distance (precomputed offline over the street network) is the operative
+    # "nearest bin" distance when the grid carries it; straight-line is kept for reference.
+    if "nearest_bin_walk_m" in cand.columns:
+        cand["nearest_bin_straight_m"] = cand["nearest_bin_m"]
+        cand["nearest_bin_m"] = pd.to_numeric(
+            cand["nearest_bin_walk_m"], errors="coerce").fillna(cand["nearest_bin_m"])
+
     keep = ["lat", "lon", "borough", "activity_score", "nearest_bin_m"]
     # Carry optional grid columns through if the grid has them (composite sources):
     # eligibility signals, sanitation district / BID tags, businesses, and basket-need.
-    for extra in ("eligible", "near_transit", "commercial_area",
+    for extra in ("eligible", "near_transit", "near_bus", "commercial_area",
                   "district", "in_bid", "business_count", "score_basket_need",
-                  "proxy_divergence"):
+                  "proxy_divergence", "nearest_bin_straight_m"):
         if extra in cand.columns:
             keep.append(extra)
     return cand[keep].reset_index(drop=True), bins.reset_index(drop=True)
@@ -644,11 +662,14 @@ def defend_html(row) -> str:
     head = f"<b>Suggested new bin</b>"
     if corner:
         head += f"<br/><b>{corner}</b>"
+    straight = getattr(row, "nearest_bin_straight_m", None)
+    walked = straight is not None and not pd.isna(straight)
+    dist_label = "Walking distance to nearest bin" if walked else "Nearest existing bin"
     parts = [
         head,
         f"Priority: <b>{pr}</b>/100",
         f"Busier than <b>{ai}%</b> of corners in view",
-        f"Nearest existing bin: <b>{gap_m:.0f} m</b> ({gap_m * 3.281:.0f} ft) away",
+        f"{dist_label}: <b>{gap_m:.0f} m</b> ({gap_m * 3.281:.0f} ft) away",
     ]
     bc = getattr(row, "business_count", None)
     if bc is not None and not pd.isna(bc):
@@ -764,22 +785,41 @@ def compute_validation(proxy, bins_raw, dot_df) -> dict:
 
     Returns a dict; values are None when a check can't be run.
     """
-    res = {"recovery": None, "n_bins": 0, "dot_corr": None, "n_dot": 0}
+    res = {"recovery": None, "n_bins": 0, "dot_corr": None, "n_dot": 0,
+           "holdout": None, "n_holdout": 0}
     try:
         if proxy is None or "eligible" not in proxy.columns:
             return res
         cells = proxy.dropna(subset=["lat", "lon", "activity_score"]).copy()
         cells["ai"] = cells["activity_score"].rank(pct=True) * 100
-        tree = cKDTree(to_meters(cells["lat"].values, cells["lon"].values))
+        cell_xy = to_meters(cells["lat"].values, cells["lon"].values)
+        tree = cKDTree(cell_xy)
 
         b, la, lo = pick_lat_lon_columns(bins_raw)
         bins = clean_latlon(b, la, lo)
         if not bins.empty:
             _, bi = tree.query(to_meters(bins["lat"].values, bins["lon"].values), k=1)
-            elig = cells["eligible"].astype(bool).to_numpy()[bi]
-            busy = cells["ai"].to_numpy()[bi] >= 50
-            res["recovery"] = float((elig & busy).mean())
+            elig = cells["eligible"].astype(bool).to_numpy()
+            busy = cells["ai"].to_numpy() >= 50
+            res["recovery"] = float((elig[bi] & busy[bi]).mean())
             res["n_bins"] = int(len(bins))
+
+            # Hold-out test: hide 20% of bins. Among the hidden ones whose removal actually
+            # creates a gap (no retained bin within 200 m), what share sit where the model
+            # would independently call for a basket (busy AND eligible)? That is the real
+            # predictive question - and it isn't dragged down by how densely baskets cluster.
+            if len(bins) > 50:
+                rng = np.random.default_rng(0)
+                test_mask = rng.random(len(bins)) < 0.2
+                train, test = bins[~test_mask], bins[test_mask]
+                if len(train) and len(test):
+                    test_xy = to_meters(test["lat"].values, test["lon"].values)
+                    tnn = cKDTree(to_meters(train["lat"].values, train["lon"].values)).query(test_xy, k=1)[0]
+                    iso = test_xy[tnn >= 200.0]              # removing these makes a real gap
+                    if len(iso):
+                        ci = tree.query(iso, k=1)[1]         # their cells
+                        res["holdout"] = float((busy[ci] & elig[ci]).mean())
+                        res["n_holdout"] = int(len(iso))
 
         if dot_df is not None and len(dot_df):
             _, di = tree.query(to_meters(dot_df["lat"].values, dot_df["lon"].values), k=1)
@@ -856,7 +896,7 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
     if show_eligibility and entrances_df is not None and len(entrances_df):
         for e in entrances_df.itertuples():
             folium.CircleMarker(
-                [e.lat, e.lon], radius=3, color="#6f42c1", weight=0, fill=True, fill_opacity=0.7,
+                [e.lat, e.lon], radius=3, color=COLORS["subway"], weight=0, fill=True, fill_opacity=0.7,
                 popup="Subway entrance (a 'near transit' signal for eligibility)",
             ).add_to(fmap)
 
@@ -865,7 +905,7 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
     if businesses_df is not None and len(businesses_df):
         for biz in thin_points(businesses_df, 1500).itertuples():
             folium.CircleMarker(
-                [biz.lat, biz.lon], radius=2, color="#e8820c", weight=0,
+                [biz.lat, biz.lon], radius=2, color=COLORS["business"], weight=0,
                 fill=True, fill_opacity=0.5,
                 popup=folium.Popup(f"<b>{getattr(biz, 'name', 'Business')}</b>", max_width=200),
             ).add_to(fmap)
@@ -875,9 +915,9 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
     if relocations_df is not None and len(relocations_df):
         for _, row in relocations_df.iterrows():
             folium.PolyLine([[row["From lat"], row["From lon"]], [row["To lat"], row["To lon"]]],
-                            color="#e8820c", weight=2, opacity=0.7).add_to(fmap)
+                            color=COLORS["move"], weight=2, opacity=0.7).add_to(fmap)
             folium.CircleMarker(
-                [row["From lat"], row["From lon"]], radius=5, color="#e8820c", weight=2,
+                [row["From lat"], row["From lon"]], radius=5, color=COLORS["move"], weight=2,
                 fill=True, fill_opacity=0.15,
                 popup=folium.Popup(f"<b>Move this bin</b><br/>to {row['Move to']}", max_width=220),
             ).add_to(fmap)
@@ -893,7 +933,7 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
         for d in dot_df.itertuples():
             radius = 5 + 22 * (np.sqrt(d.ped_count) / np.sqrt(max_count))
             folium.CircleMarker(
-                [d.lat, d.lon], radius=float(radius), color="#1f6feb", weight=1,
+                [d.lat, d.lon], radius=float(radius), color=COLORS["dot"], weight=1,
                 fill=True, fill_opacity=0.12,
                 popup=folium.Popup(
                     f"<b>DOT verified pedestrian count</b><br/>{d.street}<br/>"
@@ -913,7 +953,7 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
                 f"ID {getattr(b, 'basket_id', '')} &middot; {getattr(b, 'basket_type', '')}",
                 max_width=220)
         folium.CircleMarker(
-            [b.lat, b.lon], radius=2, color="#cc2200", weight=0, fill=True, fill_opacity=0.5,
+            [b.lat, b.lon], radius=2, color=COLORS["bin"], weight=0, fill=True, fill_opacity=0.5,
             popup=popup,
         ).add_to(fmap)
 
@@ -931,22 +971,23 @@ def make_map(bins_df: pd.DataFrame, suggested_df: pd.DataFrame, borough: str,
         tip = (corner + " - " if corner else "") + f"Priority {priority}/100"
         folium.CircleMarker(
             [plat, plon], radius=radius,
-            color="#b06a00" if risk else "#00aa44",
+            color=COLORS["misuse"] if risk else COLORS["suggestion"],
             weight=2 if risk else 0, fill=True,
             fill_opacity=0.12 if risk else opacity,
             popup=folium.Popup(defend_html(s), max_width=300), tooltip=tip,
         ).add_to(fmap)
 
-    # A small fixed color key so the map reads on its own.
-    legend_html = """<div style="position:fixed;bottom:18px;left:18px;z-index:9999;
+    # A small fixed color key (colorblind-safe palette) so the map reads on its own.
+    legend_html = f"""<div style="position:fixed;bottom:18px;left:18px;z-index:9999;
       background:rgba(255,255,255,0.92);padding:8px 10px;border:1px solid #bbb;border-radius:6px;
       font:12px Arial,sans-serif;color:#222;line-height:1.6">
-      <span style="color:#cc2200">&#9679;</span> existing bin
-      &nbsp;<span style="color:#00aa44">&#9679;</span> suggested corner
-      &nbsp;<span style="color:#b06a00">&#9711;</span> misuse risk<br/>
-      <span style="color:#e8820c">&#9679;</span> business / move
-      &nbsp;<span style="color:#1f6feb">&#9679;</span> DOT count
-      &nbsp;<span style="color:#6f42c1">&#9679;</span> subway</div>"""
+      <span style="color:{COLORS['bin']}">&#9679;</span> existing bin
+      &nbsp;<span style="color:{COLORS['suggestion']}">&#9679;</span> suggested corner
+      &nbsp;<span style="color:{COLORS['misuse']}">&#9711;</span> misuse risk<br/>
+      <span style="color:{COLORS['business']}">&#9679;</span> business
+      &nbsp;<span style="color:{COLORS['move']}">&#9679;</span> move
+      &nbsp;<span style="color:{COLORS['dot']}">&#9679;</span> DOT
+      &nbsp;<span style="color:{COLORS['subway']}">&#9679;</span> subway</div>"""
     fmap.get_root().html.add_child(folium.Element(legend_html))
     return fmap
 
@@ -972,6 +1013,19 @@ source_options = build_source_options(proxy_df, nypd_df)
 default_gap = calibrated_min_gap(proxy_df, bins_raw)
 district_list = (sorted(d for d in proxy_df["district"].dropna().unique() if d)
                  if proxy_df is not None and "district" in proxy_df.columns else [])
+
+# Data vintage: when the bundled grid was assembled (the file's own timestamp).
+try:
+    import datetime
+    data_date = datetime.date.fromtimestamp(os.path.getmtime(PROXY_GRID_CSV)).strftime("%b %d, %Y")
+except Exception:
+    data_date = None
+
+# Shareable view: seed preset / borough / district from the URL on first load.
+_qp = st.query_params
+for _k, _ok in [("preset", None), ("borough", set(BOROUGH_CENTERS)), ("district", set(district_list))]:
+    if _k in _qp and _k not in st.session_state and (_ok is None or _qp[_k] in _ok):
+        st.session_state[_k] = _qp[_k]
 
 # Figure out which layers are actually inside the composite grid, so the
 # description we show the user is always honest (e.g. Citibike only appears
@@ -1025,6 +1079,7 @@ with st.sidebar:
     borough = st.selectbox(
         "Borough",
         ["All Boroughs", "Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"],
+        key="borough",
         help="Focus on one borough. Activity is ranked within it, so Queens is judged against "
              "Queens, not crowded Manhattan.",
     )
@@ -1061,7 +1116,7 @@ with st.sidebar:
     st.divider()
     st.markdown("**Output**")
     district_choice = st.selectbox(
-        "Sanitation district", ["All districts"] + district_list,
+        "Sanitation district", ["All districts"] + district_list, key="district",
         help="Narrow the shortlist, export, and report to one DSNY district (e.g. BKN03).",
     ) if district_list else "All districts"
     budget = st.number_input(
@@ -1094,8 +1149,15 @@ with st.sidebar:
     show_all         = "All-cell heatmap" in layers
 
     st.divider()
-    st.caption("Built with NYC Open Data. All data is bundled, so the app runs without "
-               "downloading anything.")
+    if data_date:
+        st.caption(f"Data assembled {data_date} from NYC Open Data (311, PLUTO, MTA, DOT, "
+                   "DOHMH, DSNY). Bundled, so the app downloads nothing at runtime.")
+    else:
+        st.caption("Built with NYC Open Data. All data is bundled, so the app runs without "
+                   "downloading anything.")
+
+# Persist the shareable view in the URL (so a configured map can be emailed).
+st.query_params.update({"preset": preset, "borough": borough, "district": district_choice})
 
 # ---- Run the pipeline for the chosen settings ----
 ped_df = activity_input(source_options, source_choice, proxy_df, nypd_df)
@@ -1161,20 +1223,20 @@ left, right = st.columns([2, 1], gap="large")
 
 with left:
     st.subheader("Coverage Map")
-    legend = "Red dots are existing bins. Green dots are suggested new spots (brighter means higher priority)."
+    legend = "Blue dots are existing bins. Orange dots are suggested new spots (brighter means higher priority)."
     if show_dot and len(dot_scope):
-        legend += " Blue circles are DOT pedestrian counts."
+        legend += " Grey circles are DOT pedestrian counts."
     if show_all:
         legend += " The heat shows activity level."
     if show_eligibility:
         legend += " Green heat shows commercial floor area (businesses); purple dots are subway entrances."
     if show_business:
-        legend += " Orange dots are nearby businesses."
+        legend += " Sky-blue dots are nearby businesses."
     if relocation_mode:
-        legend += " Orange lines show a bin to move and the corner to move it to."
+        legend += " Green lines show a bin to move and the corner to move it to."
     if snap_corners:
         legend += " Suggestions sit on the nearest real street corner."
-    st.caption(legend + " Click any dot for details.")
+    st.caption(legend + " Click any dot for details. See the key on the map.")
     if apply_gate:
         if "eligible" in cand_df.columns:
             st.caption("DSNY eligibility rules are ON: showing only commercial or transit-eligible "
@@ -1230,6 +1292,12 @@ with right:
                     f"**DOT agreement: Spearman r = {val['dot_corr']:.2f}** between our activity "
                     f"rank and the {val['n_dot']} real DOT pedestrian counts (1.0 = perfect, "
                     "0 = none).")
+            if val["holdout"] is not None:
+                st.caption(
+                    f"**Hold-out test: {val['holdout'] * 100:.0f}%** - of {val['n_holdout']:,} hidden "
+                    "baskets whose removal leaves a real gap, this share sit where the model "
+                    "independently calls for a basket (busy and eligible). Tests prediction, not "
+                    "just agreement.")
             st.caption("These are transparent sanity checks, not a trained model's accuracy.")
 
     st.divider()
@@ -1313,7 +1381,8 @@ ranked["Borough"]        = ranked["borough"]
 if "district" in ranked.columns:
     ranked["District"]   = ranked["district"]
 ranked["Activity index"] = ranked["activity_index"]
-ranked["Gap to bin (m)"] = ranked["nearest_bin_m"].round(0).astype(int)
+gap_label = "Walk to bin (m)" if "nearest_bin_straight_m" in suggested.columns else "Gap to bin (m)"
+ranked[gap_label] = ranked["nearest_bin_m"].round(0).astype(int)
 if "recommended_baskets" in ranked.columns:
     ranked["Baskets"]    = ranked["recommended_baskets"]
 if "misuse_risk" in ranked.columns:
@@ -1332,7 +1401,7 @@ show_cols = ["Rank", "Priority"]
 if "Corner" in ranked.columns:      show_cols.append("Corner")
 show_cols.append("Borough")
 if "District" in ranked.columns:    show_cols.append("District")
-show_cols += ["Activity index", "Gap to bin (m)"]
+show_cols += ["Activity index", gap_label]
 if "Baskets" in ranked.columns:     show_cols.append("Baskets")
 if "Misuse risk" in ranked.columns: show_cols.append("Misuse risk")
 if "Confidence" in ranked.columns:  show_cols.append("Confidence")
