@@ -298,9 +298,13 @@ def load_citizen_submissions() -> pd.DataFrame:
             with conn.session as s:
                 s.execute(text(CITIZEN_TABLE_SQL))
                 s.commit()
-            df = conn.query(
-                "SELECT id, created_at, lat, lon, corner_name, borough, note, photo, "
-                "photo_ext FROM citizen_reports ORDER BY id DESC LIMIT 1000", ttl=0)
+            # Read through the engine, NOT conn.query(): conn.query() pushes results
+            # through Streamlit's cache, which cannot serialize the raw photo bytes
+            # and fails the whole read with "Cannot serialize the return value".
+            df = pd.read_sql(
+                text("SELECT id, created_at, lat, lon, corner_name, borough, note, "
+                     "photo, photo_ext FROM citizen_reports ORDER BY id DESC LIMIT 1000"),
+                conn.engine)
             out = pd.DataFrame({
                 "id": df["id"],
                 "timestamp": pd.to_datetime(df["created_at"]).dt.strftime("%Y-%m-%d %H:%M"),
