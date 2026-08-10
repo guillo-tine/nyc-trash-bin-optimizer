@@ -6,3 +6,7 @@ pyproj>=3.5
 folium>=0.15
 streamlit-folium>=0.18
 requests>=2.31
+# Community-report storage. Without a [connections.reports] secret the app falls
+# back to a local CSV and these are unused.
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
